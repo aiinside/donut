@@ -5,14 +5,10 @@ MIT License
 """
 import argparse
 import datetime
-import json
 import os
-import random
-from io import BytesIO
 from os.path import basename
 from pathlib import Path
 
-import numpy as np
 import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint

@@ -123,7 +123,8 @@ class DonutModelPLModule(pl.LightningModule):
             "name": "learning_rate",
             "interval": "step",
         }
-        return [optimizer], [scheduler]
+        # FTじゃないので一旦手動で外す
+        return [optimizer]#, [scheduler]
 
     @staticmethod
     def cosine_scheduler(optimizer, training_steps, warmup_steps):

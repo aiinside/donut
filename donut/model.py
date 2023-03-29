@@ -10,6 +10,7 @@ from typing import Any, List, Optional, Union
 
 import numpy as np
 import PIL
+from PIL.Image import Resampling
 import timm
 import torch
 import torch.nn as nn
@@ -69,6 +70,7 @@ class SwinEncoder(nn.Module):
             num_heads=[4, 8, 16, 32],
             num_classes=0,
         )
+        # self.model.set_grad_checkpointing()
 
         # weight init with swin
         if not name_or_path:
@@ -115,6 +117,60 @@ class SwinEncoder(nn.Module):
         ):
             img = rotate(img, angle=-90, expand=True)
         img = resize(img, min(self.input_size))
+        img.thumbnail((self.input_size[1], self.input_size[0]), resample=Resampling.BOX)
+        delta_width = self.input_size[1] - img.width
+        delta_height = self.input_size[0] - img.height
+        if random_padding:
+            pad_width = np.random.randint(low=0, high=delta_width + 1)
+            pad_height = np.random.randint(low=0, high=delta_height + 1)
+        else:
+            pad_width = delta_width // 2
+            pad_height = delta_height // 2
+        padding = (
+            pad_width,
+            pad_height,
+            delta_width - pad_width,
+            delta_height - pad_height,
+        )
+        
+        return self.to_tensor(ImageOps.expand(img, padding))
+
+class MaxVitEncoder(nn.Module):
+    def __init__(self,
+                input_size: List[int],
+                align_long_axis: bool,) -> None:
+        super().__init__()
+        self.body:timm.models.maxxvit.MaxxVit = timm.create_model('maxvit_base_224', img_size=256)
+        self.body.head = None
+        self.input_size = input_size
+        self.align_long_axis = align_long_axis
+        self.to_tensor = transforms.Compose(
+            [
+                transforms.ToTensor(),
+            ]
+        )
+        # self.body.set_grad_checkpointing()
+
+    def forward(self, xx):
+        xx = self.body.stem(xx)
+        yy = self.body.stages(xx)
+        yy = yy.flatten(2).permute(0,2,1) # BCHW -> BNC
+        return yy
+    
+    def prepare_input(self, img: PIL.Image.Image, random_padding: bool = False) -> torch.Tensor:
+        """
+        Convert PIL Image to tensor according to specified input_size after following steps below:
+            - resize
+            - rotate (if align_long_axis is True and image is not aligned longer axis with canvas)
+            - pad
+        """
+        img = img.convert("RGB")
+        if self.align_long_axis and (
+            (self.input_size[0] > self.input_size[1] and img.width > img.height)
+            or (self.input_size[0] < self.input_size[1] and img.width < img.height)
+        ):
+            img = rotate(img, angle=-90, expand=True)
+        img = resize(img, min(self.input_size))
         img.thumbnail((self.input_size[1], self.input_size[0]))
         delta_width = self.input_size[1] - img.width
         delta_height = self.input_size[0] - img.height
@@ -131,7 +187,6 @@ class SwinEncoder(nn.Module):
             delta_height - pad_height,
         )
         return self.to_tensor(ImageOps.expand(img, padding))
-
 
 class BARTDecoder(nn.Module):
     """
@@ -170,9 +225,11 @@ class BARTDecoder(nn.Module):
                 vocab_size=len(self.tokenizer),
                 scale_embedding=True,
                 add_final_layer_norm=True,
+                # d_model=768,
             )
         )
         self.model.forward = self.forward  #  to get cross attentions and utilize `generate` function
+        # self.model._set_gradient_checkpointing(self.model, True)
 
         self.model.config.is_encoder_decoder = True  # to get cross-attention
         self.add_special_tokens(["<sep/>"])  # <sep/> is used for representing a list in a JSON
@@ -180,23 +237,23 @@ class BARTDecoder(nn.Module):
         self.model.prepare_inputs_for_generation = self.prepare_inputs_for_inference
 
         # weight init with asian-bart
-        if not name_or_path:
-            bart_state_dict = MBartForCausalLM.from_pretrained("hyunwoongko/asian-bart-ecjk").state_dict()
-            new_bart_state_dict = self.model.state_dict()
-            for x in new_bart_state_dict:
-                if x.endswith("embed_positions.weight") and self.max_position_embeddings != 1024:
-                    new_bart_state_dict[x] = torch.nn.Parameter(
-                        self.resize_bart_abs_pos_emb(
-                            bart_state_dict[x],
-                            self.max_position_embeddings
-                            + 2,  # https://github.com/huggingface/transformers/blob/v4.11.3/src/transformers/models/mbart/modeling_mbart.py#L118-L119
-                        )
-                    )
-                elif x.endswith("embed_tokens.weight") or x.endswith("lm_head.weight"):
-                    new_bart_state_dict[x] = bart_state_dict[x][: len(self.tokenizer), :]
-                else:
-                    new_bart_state_dict[x] = bart_state_dict[x]
-            self.model.load_state_dict(new_bart_state_dict)
+        # if not name_or_path:
+        #     bart_state_dict = MBartForCausalLM.from_pretrained("hyunwoongko/asian-bart-ecjk").state_dict()
+        #     new_bart_state_dict = self.model.state_dict()
+        #     for x in new_bart_state_dict:
+        #         if x.endswith("embed_positions.weight") and self.max_position_embeddings != 1024:
+        #             new_bart_state_dict[x] = torch.nn.Parameter(
+        #                 self.resize_bart_abs_pos_emb(
+        #                     bart_state_dict[x],
+        #                     self.max_position_embeddings
+        #                     + 2,  # https://github.com/huggingface/transformers/blob/v4.11.3/src/transformers/models/mbart/modeling_mbart.py#L118-L119
+        #                 )
+        #             )
+        #         elif x.endswith("embed_tokens.weight") or x.endswith("lm_head.weight"):
+        #             new_bart_state_dict[x] = bart_state_dict[x][: len(self.tokenizer), :]
+        #         else:
+        #             new_bart_state_dict[x] = bart_state_dict[x]
+        #     self.model.load_state_dict(new_bart_state_dict)
 
     def add_special_tokens(self, list_of_tokens: List[str]):
         """
@@ -386,6 +443,10 @@ class DonutModel(PreTrainedModel):
             encoder_layer=self.config.encoder_layer,
             name_or_path=self.config.name_or_path,
         )
+        # self.encoder = MaxVitEncoder(
+        #     self.config.input_size,
+        #     self.config.align_long_axis
+        # )
         self.decoder = BARTDecoder(
             max_position_embeddings=self.config.max_position_embeddings,
             decoder_layer=self.config.decoder_layer,
@@ -403,6 +464,8 @@ class DonutModel(PreTrainedModel):
             decode_labels: (batch_size, sequence_length)
         """
         encoder_outputs = self.encoder(image_tensors)
+        # encoder_outputs.shape
+        # torch.Size([4, 3072, 1024])
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             encoder_hidden_states=encoder_outputs,

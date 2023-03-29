@@ -11,11 +11,11 @@ from typing import Any, Dict, List, Tuple, Union
 
 import torch
 import zss
-from datasets import load_dataset
 from nltk import edit_distance
 from torch.utils.data import Dataset
 from transformers.modeling_utils import PreTrainedModel
 from zss import Node
+import PIL.Image
 
 
 def save_json(write_path: Union[str, bytes, os.PathLike], save_obj: Any):
@@ -27,6 +27,18 @@ def load_json(json_path: Union[str, bytes, os.PathLike]):
     with open(json_path, "r") as f:
         return json.load(f)
 
+def load_dataset(dataset_name_or_path, split, dataset_root='/data/murayama/k8s/ocr_dxs1/donut/dataset'):
+    if split == 'train':
+        jname = 'train_data.json'
+    else:
+        jname = 'valid_data.json'
+
+    fn = os.path.join(dataset_root, dataset_name_or_path, jname)
+
+    with open(fn) as fp:
+        jdata = json.load(fp)
+    
+    return jdata
 
 class DonutDataset(Dataset):
     """
@@ -66,7 +78,8 @@ class DonutDataset(Dataset):
 
         self.gt_token_sequences = []
         for sample in self.dataset:
-            ground_truth = json.loads(sample["ground_truth"])
+            # ground_truth = json.loads(sample["ground_truth"])
+            ground_truth = sample
             if "gt_parses" in ground_truth:  # when multiple ground truths are available, e.g., docvqa
                 assert isinstance(ground_truth["gt_parses"], list)
                 gt_jsons = ground_truth["gt_parses"]
@@ -104,9 +117,10 @@ class DonutDataset(Dataset):
             labels : masked labels (model doesn't need to predict prompt and pad token)
         """
         sample = self.dataset[idx]
+        image = PIL.Image.open(sample['image'])
 
         # input_tensor
-        input_tensor = self.donut_model.encoder.prepare_input(sample["image"], random_padding=self.split == "train")
+        input_tensor = self.donut_model.encoder.prepare_input(image, random_padding=self.split == "train")
 
         # input_ids
         processed_parse = random.choice(self.gt_token_sequences[idx])  # can be more than one, e.g., DocVQA Task 1
