@@ -17,6 +17,8 @@ from transformers.modeling_utils import PreTrainedModel
 from zss import Node
 import PIL.Image
 
+from tqdm import tqdm
+
 
 def save_json(write_path: Union[str, bytes, os.PathLike], save_obj: Any):
     with open(write_path, "w") as f:
@@ -77,7 +79,7 @@ class DonutDataset(Dataset):
         self.dataset_length = len(self.dataset)
 
         self.gt_token_sequences = []
-        for sample in self.dataset:
+        for sample in tqdm(self.dataset):
             # ground_truth = json.loads(sample["ground_truth"])
             ground_truth = sample
             if "gt_parses" in ground_truth:  # when multiple ground truths are available, e.g., docvqa
@@ -92,7 +94,8 @@ class DonutDataset(Dataset):
                     task_start_token
                     + self.donut_model.json2token(
                         gt_json,
-                        update_special_tokens_for_json_key=self.split == "train",
+                        # update_special_tokens_for_json_key=self.split == "train",
+                        update_special_tokens_for_json_key=False,
                         sort_json_key=self.sort_json_key,
                     )
                     + self.donut_model.decoder.tokenizer.eos_token

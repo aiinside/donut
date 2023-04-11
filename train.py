@@ -53,6 +53,12 @@ def train(config):
     model_module = DonutModelPLModule(config)
     data_module = DonutDataPLModule(config)
 
+    if 'classes' in config:
+        stokens = []
+        for cn in config.classes:
+            stokens += [fr"<s_{cn}>", fr"</s_{cn}>"]
+        model_module.model.decoder.add_special_tokens(stokens)
+
     # add datasets to data_module
     datasets = {"train": [], "validation": []}
     for i, dataset_name_or_path in enumerate(config.dataset_name_or_paths):
@@ -126,13 +132,17 @@ def train(config):
         callbacks=[lr_callback, checkpoint_callback],
     )
 
-    trainer.fit(model_module, data_module)
+    if args.eval:
+        trainer.validate(model_module, data_module)
+    else:
+        trainer.fit(model_module, data_module)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--exp_version", type=str, required=False)
+    parser.add_argument('--eval', action='store_true')
     args, left_argv = parser.parse_known_args()
 
     config = Config(args.config)

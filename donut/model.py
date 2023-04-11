@@ -555,7 +555,7 @@ class DonutModel(PreTrainedModel):
 
         return output
 
-    def json2token(self, obj: Any, update_special_tokens_for_json_key: bool = True, sort_json_key: bool = True):
+    def json2token(self, obj: Any, update_special_tokens_for_json_key: bool = True, sort_json_key: bool = True, can_value_key=False):
         """
         Convert an ordered JSON object into a token sequence
         """
@@ -583,8 +583,9 @@ class DonutModel(PreTrainedModel):
             )
         else:
             obj = str(obj)
-            if f"<{obj}/>" in self.decoder.tokenizer.all_special_tokens:
-                obj = f"<{obj}/>"  # for categorical special tokens
+            if can_value_key:
+                if f"<{obj}/>" in self.decoder.tokenizer.all_special_tokens:
+                    obj = f"<{obj}/>"  # for categorical special tokens
             return obj
 
     def token2json(self, tokens, is_inner_value=False):
