@@ -102,6 +102,19 @@ class DonutDataset(Dataset):
                     for gt_json in gt_jsons  # load json from list of json
                 ]
             )
+        keep = []
+        for ii, sample in enumerate(tqdm(self.gt_token_sequences)):
+            ids = self.donut_model.decoder.tokenizer(
+                sample,
+                add_special_tokens=False,
+                return_tensors="pt",
+            )["input_ids"].squeeze(0)
+            if ids.shape[0] < self.max_length:
+                keep.append(ii)
+
+        if len(keep) != len(self.gt_token_sequences):
+            print('long gt sequences are discarded {} -> {}'.format(len(self.gt_token_sequences), len(keep)))
+            self.gt_token_sequences = [self.gt_token_sequences[ii] for ii in keep]
 
         self.donut_model.decoder.add_special_tokens([self.task_start_token, self.prompt_end_token])
         self.prompt_end_token_id = self.donut_model.decoder.tokenizer.convert_tokens_to_ids(self.prompt_end_token)
