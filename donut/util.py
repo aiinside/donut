@@ -76,7 +76,6 @@ class DonutDataset(Dataset):
         self.sort_json_key = sort_json_key
 
         self.dataset = load_dataset(dataset_name_or_path, split=self.split)
-        self.dataset_length = len(self.dataset)
 
         self.gt_token_sequences = []
         for sample in tqdm(self.dataset):
@@ -115,12 +114,13 @@ class DonutDataset(Dataset):
         if len(keep) != len(self.gt_token_sequences):
             print('long gt sequences are discarded {} -> {}'.format(len(self.gt_token_sequences), len(keep)))
             self.gt_token_sequences = [self.gt_token_sequences[ii] for ii in keep]
+            self.dataset = [self.dataset[ii] for ii in keep]
 
         self.donut_model.decoder.add_special_tokens([self.task_start_token, self.prompt_end_token])
         self.prompt_end_token_id = self.donut_model.decoder.tokenizer.convert_tokens_to_ids(self.prompt_end_token)
 
     def __len__(self) -> int:
-        return self.dataset_length
+        return len(self.dataset)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """

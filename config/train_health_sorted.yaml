@@ -2,7 +2,7 @@ resume_from_checkpoint_path: null # only used for resume_from_checkpoint option 
 result_path: "./result"
 pretrained_model_name_or_path: "/data/murayama/k8s/ocr_dxs1/donut/result/train_aii/20230403_165407"
 dataset_name_or_paths: ["kie/health"] # loading datasets (from moldehub or path)
-sort_json_key: False # cord dataset is preprocessed, and publicly available at https://huggingface.co/datasets/naver-clova-ix/cord-v2
+sort_json_key: True # cord dataset is preprocessed, and publicly available at https://huggingface.co/datasets/naver-clova-ix/cord-v2
 train_batch_sizes: [2]
 val_batch_sizes: [1]
 input_size: [1600,1600] # when the input resolution differs from the pre-training setting, some weights will be newly initialized (but the model training would be okay)
