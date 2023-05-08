@@ -12,11 +12,15 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 from nltk import edit_distance
+import Levenshtein
 from pytorch_lightning.utilities import rank_zero_only
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
+from timm.optim import RAdam
+from torch.distributed.optim.zero_redundancy_optimizer import ZeroRedundancyOptimizer
+
 
 from donut import DonutConfig, DonutModel
 
@@ -33,6 +37,8 @@ class DonutModelPLModule(pl.LightningModule):
                 max_length=self.config.max_length,
                 align_long_axis=self.config.align_long_axis,
                 ignore_mismatched_sizes=True,
+                enable_token_weight=self.config.enable_token_weight,
+                swinv2=self.config.get('swinv2',False)
             )
         else:
             self.model = DonutModel(
@@ -40,10 +46,16 @@ class DonutModelPLModule(pl.LightningModule):
                     input_size=self.config.input_size,
                     max_length=self.config.max_length,
                     align_long_axis=self.config.align_long_axis,
+                    enable_token_weight=self.config.enable_token_weight,
+                    swinv2=self.config.get('swinv2',False),
                     # with DonutConfig, the architecture customization is available, e.g.,
                     # encoder_layer=[2,2,14,2], decoder_layer=4, ...
                 )
             )
+
+        if self.config.get('fix_encoder', False):
+            for pp in self.model.encoder.parameters():
+                pp.requires_grad = False
 
     def training_step(self, batch, batch_idx):
         image_tensors, decoder_input_ids, decoder_labels = list(), list(), list()
@@ -77,7 +89,9 @@ class DonutModelPLModule(pl.LightningModule):
             pred = re.sub(r"(?:(?<=>) | (?=</s_))", "", pred)
             answer = re.sub(r"<.*?>", "", answer, count=1)
             answer = answer.replace(self.model.decoder.tokenizer.eos_token, "")
-            scores.append(edit_distance(pred, answer) / max(len(pred), len(answer)))
+            score = Levenshtein.distance(pred, answer) / max(len(pred), len(answer))
+            scores.append(score)
+            # scores.append(edit_distance(pred, answer) / max(len(pred), len(answer)))
 
             if self.config.get("verbose", False) and len(scores) == 1:
                 self.print(f"Prediction: {pred}")
@@ -117,7 +131,8 @@ class DonutModelPLModule(pl.LightningModule):
             max_iter = min(self.config.max_steps, max_iter) if max_iter is not None else self.config.max_steps
 
         assert max_iter is not None
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.config.lr)
+        optimizer = RAdam(self.parameters(), lr=self.config.lr)
+        # optimizer = ZeroRedundancyOptimizer(self.parameters(), torch.optim.Adam, lr=self.config.lr)
         scheduler = {
             "scheduler": self.cosine_scheduler(optimizer, max_iter, self.config.warmup_steps),
             "name": "learning_rate",

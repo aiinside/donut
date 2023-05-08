@@ -16,6 +16,8 @@ from torch.utils.data import Dataset
 from transformers.modeling_utils import PreTrainedModel
 from zss import Node
 import PIL.Image
+import numpy as np
+import cv2
 
 from tqdm import tqdm
 
@@ -29,18 +31,95 @@ def load_json(json_path: Union[str, bytes, os.PathLike]):
     with open(json_path, "r") as f:
         return json.load(f)
 
-def load_dataset(dataset_name_or_path, split, dataset_root='/data/murayama/k8s/ocr_dxs1/donut/dataset'):
+def load_dataset(dataset_name_or_path, split, dataset_root='/data/murayama/k8s/ocr_dxs1/donut/dataset', sort_key=False, classes:List[str]=None, out_empty=False, nested=False):
     if split == 'train':
         jname = 'train_data.json'
     else:
         jname = 'valid_data.json'
+
+    mask_key = ['current_0', 'current_1', 'current_2', 'last_2_0', 'last_2_1', 'last_2_2', 'last_1_0', 'last_1_1', 'last_1_2']
 
     fn = os.path.join(dataset_root, dataset_name_or_path, jname)
 
     with open(fn) as fp:
         jdata = json.load(fp)
     
+    def key_func(obj):
+        return list(obj.keys())[0]
+
+    def filter_entities(entities, classes):
+        out = []
+        for ent in entities:
+            kk, vv = list(ent.items())[0]
+            if (kk in classes): 
+               out.append({kk:vv})
+        return out
+    
+    def append_empty(entities, classes):
+        out = []
+        has_val = []
+        for ent in entities:
+            kk, vv = list(ent.items())[0]
+            if not (kk in has_val):
+                has_val.append(kk)
+                out.append({kk:vv})
+        for kk in classes:
+            if not (kk in has_val):
+                out.append({kk:''})
+        return out
+
+    def sort_by_key(entities):
+        out = []
+        for ent in sorted(entities, key=key_func):
+            kk, vv = list(ent.items())[0]
+            if kk in mask_key:
+                continue
+            out.append({kk:vv})
+        return out
+
+    for gt in jdata:
+        _gt = gt['gt_parse']
+        for ktask in _gt:
+            entities = _gt[ktask]
+            if classes:
+                entities = filter_entities(entities, classes)
+                if out_empty:
+                    entities = append_empty(entities, classes)
+
+            if sort_key:
+                entities = sort_by_key(entities)
+
+            _gt[ktask] = entities
+
+    if nested:
+        for gt in jdata:
+            _gt = gt['gt_parse']
+            for ktask in _gt:
+                entities = _gt[ktask]
+                new_dict = {'current':[], 'last_1':[], 'last_2':[]}
+                last_dict = {'_0':'current','_1':'last_1','_2':'last_2'}
+
+                for ent in entities:
+                    kk, vv = list(ent.items())[0]
+                    cn = kk[:-2]
+                    last = last_dict[kk[-2:]]
+                    new_dict[last].append({cn:vv})
+
+                _gt[ktask] = new_dict
+
     return jdata
+
+def resize_pad(img:np.ndarray, pad, target_size):
+    th, tw = target_size
+    px0,py0,_,_=pad
+
+    out = np.zeros((th,tw), np.float32)
+    ry, rx = th/img.shape[0], tw/img.shape[1]
+    rr = min(ry, rx)
+    _img = cv2.resize(img, None, fx=rr, fy=rr)
+    out[py0:py0+_img.shape[0], px0:px0+_img.shape[1]] = _img
+
+    return out
 
 class DonutDataset(Dataset):
     """
@@ -64,6 +143,9 @@ class DonutDataset(Dataset):
         task_start_token: str = "<s>",
         prompt_end_token: str = None,
         sort_json_key: bool = True,
+        out_empty_tags: bool = False,
+        classes:List[str] = None,
+        nested = False
     ):
         super().__init__()
 
@@ -75,7 +157,8 @@ class DonutDataset(Dataset):
         self.prompt_end_token = prompt_end_token if prompt_end_token else task_start_token
         self.sort_json_key = sort_json_key
 
-        self.dataset = load_dataset(dataset_name_or_path, split=self.split)
+        self.dataset = load_dataset(dataset_name_or_path, split=self.split, sort_key=self.sort_json_key, classes=classes, out_empty=out_empty_tags)
+        # self.dataset = load_dataset(dataset_name_or_path, split=self.split, sort_key=self.sort_json_key, out_empty=out_empty_tags, nested=nested)
 
         self.gt_token_sequences = []
         for sample in tqdm(self.dataset):
@@ -147,7 +230,15 @@ class DonutDataset(Dataset):
             padding="max_length",
             truncation=True,
             return_tensors="pt",
-        )["input_ids"].squeeze(0)
+        )["input_ids"].squeeze(0)        
+
+        # # char map
+        # fn = os.path.splitext(sample['image'])[0] + '.npy'
+        # cmap = np.load(fn)[:,:,0] # ch0:charmap, ch1:linkmap
+        # cmap = resize_pad(cmap, pad, self.donut_model.encoder.input_size)
+        # # encoderのscale分小さくしておく
+        # # model側でやるとめんどくさいのでここでハードコード
+        # cmap = cv2.resize(cmap, None, fx=1./32, fy=1./32)
 
         if self.split == "train":
             labels = input_ids.clone()

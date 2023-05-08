@@ -58,7 +58,6 @@ def train(config):
         for cn in config.classes:
             stokens += [fr"<s_{cn}>", fr"</s_{cn}>"]
         model_module.model.decoder.add_special_tokens(stokens)
-
     # add datasets to data_module
     datasets = {"train": [], "validation": []}
     for i, dataset_name_or_path in enumerate(config.dataset_name_or_paths):
@@ -87,6 +86,9 @@ def train(config):
                     else f"<s_{task_name}>",
                     prompt_end_token="<s_answer>" if "docvqa" in dataset_name_or_path else f"<s_{task_name}>",
                     sort_json_key=config.sort_json_key,
+                    out_empty_tags=config.out_empty_tags,
+                    classes=config.classes,
+                    nested=config.get('nested',False)
                 )
             )
             # prompt_end_token is used for ignoring a given prompt in a loss function
@@ -108,8 +110,8 @@ def train(config):
         monitor="val_metric",
         dirpath=Path(config.result_path) / config.exp_name / config.exp_version,
         filename="artifacts",
-        save_top_k=1,
-        save_last=False,
+        save_top_k=-1,
+        save_last=True,
         mode="min",
     )
 

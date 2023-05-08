@@ -18,12 +18,14 @@ import torch.nn.functional as F
 from PIL import ImageOps
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.swin_transformer import SwinTransformer
+from timm.models.swin_transformer_v2 import SwinTransformerV2
 from torchvision import transforms
 from torchvision.transforms.functional import resize, rotate
 from transformers import MBartConfig, MBartForCausalLM, XLMRobertaTokenizer
 from transformers.file_utils import ModelOutput
 from transformers.modeling_utils import PretrainedConfig, PreTrainedModel
 
+from .health_class_weight import HEALTH_CLASS_WEIGHT, HEALTH_CLASS_WEIGHT_NOSUFFIX
 
 class SwinEncoder(nn.Module):
     r"""
@@ -47,6 +49,7 @@ class SwinEncoder(nn.Module):
         window_size: int,
         encoder_layer: List[int],
         name_or_path: Union[str, bytes, os.PathLike] = None,
+        swinv2 = False
     ):
         super().__init__()
         self.input_size = input_size
@@ -61,15 +64,26 @@ class SwinEncoder(nn.Module):
             ]
         )
 
-        self.model = SwinTransformer(
-            img_size=self.input_size,
-            depths=self.encoder_layer,
-            window_size=self.window_size,
-            patch_size=4,
-            embed_dim=128,
-            num_heads=[4, 8, 16, 32],
-            num_classes=0,
-        )
+        if not swinv2:
+            self.model = SwinTransformer(
+                img_size=self.input_size,
+                depths=self.encoder_layer,
+                window_size=self.window_size,
+                patch_size=4,
+                embed_dim=128,
+                num_heads=[4, 8, 16, 32],
+                num_classes=0,
+            )
+        else:
+            self.model = SwinTransformerV2(
+                img_size=self.input_size,
+                depths=self.encoder_layer,
+                window_size=window_size,
+                patch_size=4,
+                embed_dim=128,
+                num_heads=[4,8,16,32],
+                num_classes=0
+            )
 
         # weight init with swin
         if not name_or_path:
@@ -151,11 +165,13 @@ class BARTDecoder(nn.Module):
     """
 
     def __init__(
-        self, decoder_layer: int, max_position_embeddings: int, name_or_path: Union[str, bytes, os.PathLike] = None
+        self, decoder_layer: int, max_position_embeddings: int, name_or_path: Union[str, bytes, os.PathLike] = None,
+        enable_token_weight = False
     ):
         super().__init__()
         self.decoder_layer = decoder_layer
         self.max_position_embeddings = max_position_embeddings
+        self.enable_token_weight = enable_token_weight
 
         self.tokenizer = XLMRobertaTokenizer.from_pretrained(
             "hyunwoongko/asian-bart-ecjk" if not name_or_path else name_or_path
@@ -278,7 +294,25 @@ class BARTDecoder(nn.Module):
 
         loss = None
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+
+            if self.enable_token_weight:
+                class_weight = torch.ones(self.model.config.vocab_size)
+
+                for kk, vv in HEALTH_CLASS_WEIGHT.items():
+                    start = fr'<s_{kk}>'
+                    end = fr'</s_{kk}>'
+                    token_ids = self.tokenizer.convert_tokens_to_ids([start, end])
+                    # tokenを変換してみてbartのdefault vocab_sizeより小さかったら
+                    # 登録されてないやつなのでスルーする
+                    if token_ids[0] < 50265 or token_ids[1] < 50265:
+                        continue
+                    class_weight[token_ids] = vv
+
+                class_weight = class_weight.to(device=logits.device, dtype=logits.dtype)
+            else:
+                class_weight = None
+
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, weight=class_weight)
             loss = loss_fct(logits.view(-1, self.model.config.vocab_size), labels.view(-1))
 
         if not return_dict:
@@ -354,6 +388,8 @@ class DonutConfig(PretrainedConfig):
         max_position_embeddings: int = None,
         max_length: int = 1536,
         name_or_path: Union[str, bytes, os.PathLike] = "",
+        enable_token_weight: bool = False,
+        swinv2: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -365,6 +401,8 @@ class DonutConfig(PretrainedConfig):
         self.max_position_embeddings = max_length if max_position_embeddings is None else max_position_embeddings
         self.max_length = max_length
         self.name_or_path = name_or_path
+        self.enable_token_weight = enable_token_weight
+        self.swinv2 = swinv2
 
 
 class DonutModel(PreTrainedModel):
@@ -386,11 +424,13 @@ class DonutModel(PreTrainedModel):
             window_size=self.config.window_size,
             encoder_layer=self.config.encoder_layer,
             name_or_path=self.config.name_or_path,
+            swinv2=self.config.swinv2
         )
         self.decoder = BARTDecoder(
             max_position_embeddings=self.config.max_position_embeddings,
             decoder_layer=self.config.decoder_layer,
             name_or_path=self.config.name_or_path,
+            enable_token_weight=config.enable_token_weight
         )
 
     def forward(self, image_tensors: torch.Tensor, decoder_input_ids: torch.Tensor, decoder_labels: torch.Tensor):
@@ -495,7 +535,7 @@ class DonutModel(PreTrainedModel):
 
         return output
 
-    def json2token(self, obj: Any, update_special_tokens_for_json_key: bool = True, sort_json_key: bool = True, can_value_key=False):
+    def json2token(self, obj: Any, update_special_tokens_for_json_key: bool = True, sort_json_key: bool = True, can_value_key=False, out_sep=False):
         """
         Convert an ordered JSON object into a token sequence
         """
@@ -511,15 +551,20 @@ class DonutModel(PreTrainedModel):
                 for k in keys:
                     if update_special_tokens_for_json_key:
                         self.decoder.add_special_tokens([fr"<s_{k}>", fr"</s_{k}>"])
-                    output += (
-                        fr"<s_{k}>"
-                        + self.json2token(obj[k], update_special_tokens_for_json_key, sort_json_key)
-                        + fr"</s_{k}>"
-                    )
+                    vv = obj[k]
+                    if not out_sep or vv != '':
+                        output += (
+                            fr"<s_{k}>"
+                            + self.json2token(obj[k], update_special_tokens_for_json_key, sort_json_key, can_value_key=can_value_key, out_sep=out_sep)
+                            + fr"</s_{k}>"
+                        )
+                    else:
+                        output += '<sep/>'
+
                 return output
         elif type(obj) == list:
             return r"<sep/>".join(
-                [self.json2token(item, update_special_tokens_for_json_key, sort_json_key) for item in obj]
+                [self.json2token(item, update_special_tokens_for_json_key, sort_json_key, can_value_key=can_value_key, out_sep=out_sep) for item in obj]
             )
         else:
             obj = str(obj)
