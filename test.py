@@ -33,13 +33,21 @@ def img_glob(path):
     files = [f for f in files if re.search(ext, f, re.IGNORECASE)]
     return files
 
-def test(config:Config, img_dir:str, save_path:str):
+def test(config:Config, img_dir:str, save_path:str, score_thresh):
     pretrained_model = DonutModel.from_pretrained(
         config.pretrained_model_name_or_path,
         input_size=config.input_size,
         max_length=config.max_length,
         align_long_axis=config.align_long_axis,
+        enable_char_map=config.char_map,
+        box_pred=config.get('box_pred',False)
     )
+
+    if 'classes' in config:
+        stokens = []
+        for cn in config.classes:
+            stokens += [fr"<s_{cn}>", fr"</s_{cn}>"]
+        pretrained_model.decoder.add_special_tokens(stokens)
 
     if torch.cuda.is_available():
         pretrained_model.half()
@@ -54,11 +62,12 @@ def test(config:Config, img_dir:str, save_path:str):
 
     for ii, img_path in tqdm.tqdm(enumerate(img_list)):
         image=PIL.Image.open(img_path)
-        outs = pretrained_model.inference(image, prompt='<s_health>')
+        outs = pretrained_model.inference_custom(image, prompt='<s_health>', token_score_thresh=score_thresh)
+        # outs = pretrained_model.inference(image, prompt='<s_health>')
         # outs = pretrained_model.inference(image, prompt='<s_health>', return_attentions=True, return_confs=True, return_tokens=True)
         fn = os.path.basename(os.path.splitext(img_path)[0]) + '.json'
         fn = os.path.join(save_path, fn)
-        print(outs['predictions'])
+        print(img_path)
         with open(fn, 'w') as fp:
             json.dump(outs['predictions'], fp, ensure_ascii=False, indent=4)
 
@@ -68,8 +77,9 @@ if __name__ == "__main__":
     parser.add_argument("--img_dir", type=str, default="test")
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--save_path", type=str, default=None)
+    parser.add_argument("--token_thresh", type=float, default=0.0)
     args, left_argv = parser.parse_known_args()
 
     config = Config(args.config)
 
-    test(config, args.img_dir, args.save_path)
+    test(config, args.img_dir, args.save_path, args.token_thresh)

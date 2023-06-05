@@ -20,12 +20,14 @@ from PIL import ImageOps
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.swin_transformer import SwinTransformer
 from torchvision import transforms
-from torchvision.transforms.functional import resize, rotate
+from torchvision.transforms.functional import resize, rotate, InterpolationMode
 from transformers import MBartConfig, MBartForCausalLM, XLMRobertaTokenizer
 from transformers.file_utils import ModelOutput
 from transformers.utils.generic import to_py_obj
 from transformers.modeling_utils import PretrainedConfig, PreTrainedModel
+from transformers.generation import LogitsProcessorList
 
+from .health_class_weight import HEALTH_CLASS_WEIGHT, HEALTH_CLASS_WEIGHT_NOSUFFIX
 
 class SwinEncoder(nn.Module):
     r"""
@@ -117,7 +119,7 @@ class SwinEncoder(nn.Module):
             or (self.input_size[0] < self.input_size[1] and img.width < img.height)
         ):
             img = rotate(img, angle=-90, expand=True)
-        img = resize(img, min(self.input_size))
+        img = resize(img, min(self.input_size), interpolation=InterpolationMode.BOX)
         img.thumbnail((self.input_size[1], self.input_size[0]), resample=Resampling.BOX)
         delta_width = self.input_size[1] - img.width
         delta_height = self.input_size[0] - img.height
@@ -300,11 +302,13 @@ class BARTDecoder(nn.Module):
     """
 
     def __init__(
-        self, decoder_layer: int, max_position_embeddings: int, name_or_path: Union[str, bytes, os.PathLike] = None
+        self, decoder_layer: int, max_position_embeddings: int, name_or_path: Union[str, bytes, os.PathLike] = None,
+        enable_token_weight = False
     ):
         super().__init__()
         self.decoder_layer = decoder_layer
         self.max_position_embeddings = max_position_embeddings
+        self.enable_token_weight = enable_token_weight
 
         self.tokenizer = BARTCustomTokenizer.from_pretrained(
             "hyunwoongko/asian-bart-ecjk" if not name_or_path else name_or_path
@@ -407,6 +411,7 @@ class BARTDecoder(nn.Module):
             decoder_attentions: (batch_size, num_heads, sequence_length, sequence_length)
             cross_attentions: (batch_size, num_heads, sequence_length, sequence_length)
         """
+
         output_attentions = output_attentions if output_attentions is not None else self.model.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.model.config.output_hidden_states
@@ -427,7 +432,25 @@ class BARTDecoder(nn.Module):
 
         loss = None
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+
+            if self.enable_token_weight:
+                class_weight = torch.ones(self.model.config.vocab_size)
+
+                for kk, vv in HEALTH_CLASS_WEIGHT.items():
+                    start = fr'<s_{kk}>'
+                    end = fr'</s_{kk}>'
+                    token_ids = self.tokenizer.convert_tokens_to_ids([start, end])
+                    # tokenを変換してみてbartのdefault vocab_sizeより小さかったら
+                    # 登録されてないやつなのでスルーする
+                    if token_ids[0] < 50265 or token_ids[1] < 50265:
+                        continue
+                    class_weight[token_ids] = vv
+
+                class_weight = class_weight.to(device=logits.device, dtype=logits.dtype)
+            else:
+                class_weight = None
+
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, weight=class_weight)
             loss = loss_fct(logits.view(-1, self.model.config.vocab_size), labels.view(-1))
 
         if not return_dict:
@@ -441,6 +464,7 @@ class BARTDecoder(nn.Module):
             hidden_states=outputs.hidden_states,
             decoder_attentions=outputs.attentions,
             cross_attentions=outputs.cross_attentions,
+            decoder_hidden_states=outputs.hidden_states
         )
 
     @staticmethod
@@ -503,6 +527,10 @@ class DonutConfig(PretrainedConfig):
         max_position_embeddings: int = None,
         max_length: int = 1536,
         name_or_path: Union[str, bytes, os.PathLike] = "",
+        enable_token_weight: bool = False,
+        swinv2: bool = False,
+        enable_char_map = False,
+        box_pred: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -514,6 +542,10 @@ class DonutConfig(PretrainedConfig):
         self.max_position_embeddings = max_length if max_position_embeddings is None else max_position_embeddings
         self.max_length = max_length
         self.name_or_path = name_or_path
+        self.enable_token_weight = enable_token_weight
+        self.enable_char_map = enable_char_map
+        self.swinv2 = swinv2
+        self.box_pred = box_pred
 
 
 class DonutModel(PreTrainedModel):
@@ -540,7 +572,117 @@ class DonutModel(PreTrainedModel):
             max_position_embeddings=self.config.max_position_embeddings,
             decoder_layer=self.config.decoder_layer,
             name_or_path=self.config.name_or_path,
+            enable_token_weight=config.enable_token_weight
         )
+
+        self.box_head = None
+        if config.box_pred:
+            self.box_head = nn.Sequential(
+                nn.GELU(),
+                nn.Linear(1024, 1024),
+                nn.LayerNorm(1024),
+                nn.GELU(),
+                nn.Linear(1024, 5)
+            )
+
+        self.char_haed = None
+        if config.enable_char_map:
+            self.char_haed = nn.Sequential(
+                nn.ConvTranspose2d(1024,1024,8,8),
+                nn.ReLU(),
+                nn.Conv2d(1024, 1, 3, padding=1)
+            )
+            self.upscale = nn.ConvTranspose2d(16, 1, 8, 8, bias=False)
+ 
+    def _init_weights(self, module):
+        if isinstance(module, nn.Conv2d):
+            module.bias.data.fill_(0)
+            nn.init.xavier_uniform(module.weight)
+
+    def forward_seg_head(self, encoder_outputs:torch.Tensor, cross_attentions:torch.Tensor, decoder_labels:torch.Tensor = None):
+        if decoder_labels is not None:
+            mask = (decoder_labels != -100).unsqueeze(1).unsqueeze(3).int().float()
+            cross_attentions = cross_attentions * mask
+
+        attens = cross_attentions.max(dim=2)[0]
+
+        hh, ww = self.config.input_size
+        bs = encoder_outputs.shape[0]
+        hh = hh//32
+        ww = ww//32
+        nheads = cross_attentions.shape[1]
+
+        attens = attens.reshape(-1, nheads, hh, ww)
+        attens = torch.pixel_shuffle(attens, 4)
+
+        encoder_outputs = torch.reshape(encoder_outputs, (bs, hh, ww, -1))
+        encoder_outputs = encoder_outputs.permute(0,3,1,2)
+        encoder_outputs = F.pixel_shuffle(encoder_outputs, 4)
+
+        encoder_outputs = attens * encoder_outputs
+        encoder_outputs = F.pixel_unshuffle(encoder_outputs, 4)
+        # encoder_outputs = F.pixel_shuffle(encoder_outputs, 2)
+
+        char_map = self.char_haed(encoder_outputs)
+
+        return char_map
+        # return torch.sigmoid(char_map)
+    
+    def char_loss(self, char_map:torch.Tensor, char_labels: torch.Tensor, decoder_labels: torch.Tensor, cross_attens:torch.Tensor):
+        DELTA = 0.01
+        hh, ww = self.config.input_size
+        hh = hh//32
+        ww = ww//32
+        # seg_loss = F.binary_cross_entropy_with_logits(char_map, char_labels)
+
+        # [bsize, nheads, seqlen(decoder_input), seqlen(encoder_output)]
+        mask = decoder_labels == -100
+        # attens = cross_attens.mean(dim=1) # multihead方向に平均する
+        attens = cross_attens.max(dim=1)[0] # multihead方向にmax取る
+        attens[mask] = 0
+        # attens = attens.sum(dim=1) # seq方向に足す
+        attens = attens.max(dim=1)[0] # seq方向にmaxとる
+        attens = attens.reshape(-1, 1, hh, ww)
+
+        hh, ww = char_map.shape[-2:]
+        attens = F.interpolate(attens, (hh, ww))
+        score = char_map * attens
+        loss = F.binary_cross_entropy_with_logits(score, char_labels)
+
+        # _char_map = char_map.clone().detach()
+        # char_attens = char_map[torch.where(attens > DELTA)].sigmoid()
+        # atten_score = F.binary_cross_entropy(attens, char_labels)
+        # atten_score = F.l1_loss(attens, char_labels)
+
+        return loss
+
+    def forward_box_head(self, last_hidden_state: torch.Tensor, box_labels: torch.Tensor=None):
+            # box_pred = self.box_head(last_hidden_state).sigmoid()
+            pred = self.box_head(last_hidden_state).sigmoid()
+            box_pred = pred[:,:,:4]
+            conf = pred[:,:,4]
+            loss = None
+            if not box_labels is None:
+                mask = (box_labels > 0).all(dim=-1)
+                # box数で割りたいので座標方向分掛ける
+                loss_l1 = F.l1_loss(box_pred[mask], box_labels[mask]) * 4
+
+                # iou loss
+                pred_xyxy = cxcywh_xyxy(box_pred)
+                label_xyxy = cxcywh_xyxy(box_labels)
+                loss_iou = complete_box_iou_loss(pred_xyxy[mask], label_xyxy[mask], reduction='mean')
+
+                # iou pred loss
+                # boxの尤度が知りたいのでiouを推定させてみる(samでもやってる)
+                _conf = conf[mask]
+                ious = box_iou(pred_xyxy[mask], label_xyxy[mask])
+                ious = torch.diagonal(ious, dim1=-2, dim2=-1)
+                loss_conf = F.l1_loss(_conf, ious)
+
+                # detrが cls:l1:giou = 2:5:2 だったので2.5倍しておく
+                loss = 2.5 * loss_l1 + loss_iou + loss_conf
+
+            return loss, box_pred, conf
 
     def forward(self, image_tensors: torch.Tensor, decoder_input_ids: torch.Tensor, decoder_labels: torch.Tensor):
         """
@@ -553,10 +695,14 @@ class DonutModel(PreTrainedModel):
             decode_labels: (batch_size, sequence_length)
         """
         encoder_outputs = self.encoder(image_tensors)
+        # encoder_outputs.shape
+        # torch.Size([4, 3072, 1024])
+        need_loss = decoder_labels != None
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             encoder_hidden_states=encoder_outputs,
             labels=decoder_labels,
+            output_attentions=need_loss
         )
         return decoder_outputs
 
@@ -616,6 +762,7 @@ class DonutModel(PreTrainedModel):
             hmap = hmaps[-1] # last layer
             # hmap = torch.mean(hmap, dim=0)
             hmap = torch.max(hmap, dim=0)[0]
+            # hmap = torch.pixel_shuffle(hmap, 4).squeeze(1)
 
             # dropping discard ratio activations
             flat = hmap.view(heatmap_h * heatmap_w)
@@ -651,9 +798,8 @@ class DonutModel(PreTrainedModel):
         return_confs: bool = True,
         return_tokens: bool = False,
         return_attentions: bool = False,
-        return_max_bbox: bool = False,
-        nested_list_set: set = {"Items"},
-        nested_dict_set: set = {"terms", "total", "shipto", "customer", "vendor", "invoice"}
+        return_segmap: bool = False,
+        token_score_thresh = 0.8
     ):
         """
         Generate a token sequence in an auto-regressive manner,
@@ -666,8 +812,6 @@ class DonutModel(PreTrainedModel):
                 convert prompt to tensor if image_tensor is not fed
             prompt_tensors: (1, sequence_length)
                 convert image to tensor if prompt_tensor is not fed
-            nested_list_set: Fields that are nested lists of dicts
-            nested_dict_set: Fields that are nested dicts
         """
         # prepare backbone inputs (image and prompt)
         if image is None and image_tensors is None:
@@ -700,6 +844,23 @@ class DonutModel(PreTrainedModel):
         if len(prompt_tensors.size()) == 1:
             prompt_tensors = prompt_tensors.unsqueeze(0)
 
+        sep_id = self.decoder.tokenizer.encode('<sep/>')[1]
+        def skip_lowconf_token(input_ids: torch.LongTensor, logits: torch.FloatTensor):
+            scores = logits.softmax(dim=-1)
+            max_conf = scores.max(dim=-1)[0]
+            mask = max_conf < token_score_thresh
+
+            for ii, mm in enumerate(mask):
+                if mm:
+                    scores[ii] = 0.
+                    scores[ii][sep_id] = 1.
+                else:
+                    scores[ii] = logits[ii]
+            return scores
+
+        logits_processor = LogitsProcessorList()
+        logits_processor.append(skip_lowconf_token)
+
         # get decoder output
         decoder_output = self.decoder.model.generate(
             decoder_input_ids=prompt_tensors,
@@ -714,6 +875,8 @@ class DonutModel(PreTrainedModel):
             return_dict_in_generate=True,
             output_attentions=return_attentions,
             output_scores=True,
+            output_hidden_states=True,
+            logits_processor=logits_processor
         )
 
         decoder_output_confs = torch.amax(torch.stack(decoder_output.scores, dim=1).softmax(-1), 2).cpu().numpy()[0]
@@ -724,13 +887,18 @@ class DonutModel(PreTrainedModel):
         self.return_tokens = return_tokens
         self.return_confs = return_confs
         self.DELIM = "}~}~}~{"  # important, use a DELIM that has a very low prob of appearing in text
+        sequences = []
 
         for idx, (seq, confs, idxs) in enumerate(self.decoder.tokenizer.batch_decode(decoder_output.sequences, decoder_output_confs, self.DELIM)):
             eos_tkn, pad_tkn = self.decoder.tokenizer.eos_token, self.decoder.tokenizer.pad_token
             split_seq = [tkn for tkn in seq.split(self.DELIM) if tkn]
-            confs = [confs[i] for i, tkn in enumerate(split_seq)
-                     if not(tkn.strip().lower() == eos_tkn.lower() or tkn.strip().lower() == pad_tkn.lower())]
-            idxs = [idxs[i] for i, tkn in enumerate(seq.split(self.DELIM))
+            # confs = [confs[i] for i, tkn in enumerate(split_seq)
+            #          if not(tkn.strip().lower() == eos_tkn.lower() or tkn.strip().lower() == pad_tkn.lower())]
+            confs = [confs[i] for i, tkn in enumerate(seq.split(self.DELIM))
+                     if not(tkn.strip().lower() == eos_tkn.lower() or tkn.strip().lower() == pad_tkn.lower()) and tkn]
+            # idxs = [idxs[i] for i, tkn in enumerate(seq.split(self.DELIM))
+            #         if not(tkn.strip().lower() == eos_tkn.lower() or tkn.strip().lower() == pad_tkn.lower())]
+            idxs = [idxs[i] for i, tkn in enumerate(split_seq)
                     if not(tkn.strip().lower() == eos_tkn.lower() or tkn.strip().lower() == pad_tkn.lower())]
             seq = seq.replace(eos_tkn, "").replace(pad_tkn, "")
             for i, tkn in enumerate(seq.split(self.DELIM)):
@@ -747,53 +915,31 @@ class DonutModel(PreTrainedModel):
                     output["predictions"].append(self.token2json(seq))
             else:
                 output["predictions"].append(seq)
+            sequences.append(seq.replace(self.DELIM, ''))
+
+        output['last_hidden_state'] = last_hidden_state
+        output['tokens'] = decoder_output.sequences
+        output['decoder_state'] = decoder_output.decoder_hidden_states
+        output['scores'] = decoder_output_confs[0]
+        output['sequences'] = sequences
 
         if return_attentions:
             output["attentions"] = {
                 "self_attentions": decoder_output.decoder_attentions,
                 "cross_attentions": decoder_output.cross_attentions,
             }
-        if return_max_bbox and return_confs and return_tokens:
-            preds_with_max_bbox = []
-            for pred_obj in output["predictions"]:
-                temp_pred_obj = {}
-                for top_key, top_val in pred_obj.items():
-                    if top_key in nested_list_set:
-                        temp_pred_obj[top_key] = []
-                        for item in top_val:
-                            temp_item_obj = {}
-                            for item_key, item_val in item.items():
-                                text, conf, tokens = item_val
-                                max_bbox = DonutModel.max_bbox_from_heatmap(
-                                    decoder_cross_attentions=decoder_output.cross_attentions,
-                                    tkn_indexes=tokens, final_h=1280, final_w=960
-                                )
-                                temp_item_obj[item_key] = [text, conf, tokens, max_bbox]
-                            temp_pred_obj[top_key].append(temp_item_obj)
-                    elif top_key in nested_dict_set:
-                        temp_item_obj = {}
-                        for sub_key, sub_val in top_val.items():
-                            text, conf, tokens = sub_val
-                            max_bbox = DonutModel.max_bbox_from_heatmap(
-                                decoder_cross_attentions=decoder_output.cross_attentions,
-                                tkn_indexes=tokens, final_h=1280, final_w=960
-                            )
-                            temp_item_obj[sub_key] = [text, conf, tokens, max_bbox]
-                        temp_pred_obj[top_key] = temp_item_obj
-                    else:
-                        text, conf, tokens = top_val
-                        max_bbox = DonutModel.max_bbox_from_heatmap(
-                            decoder_cross_attentions=decoder_output.cross_attentions,
-                            tkn_indexes=tokens, final_h=1280, final_w=960
-                        )
-                        temp_pred_obj[top_key] = [text, conf, tokens, max_bbox]
-                preds_with_max_bbox.append(temp_pred_obj)
 
-            output["predictions"] = preds_with_max_bbox
+        if return_segmap and self.config.enable_char_map:
+            # seq bs nhead 1 npos(bs=1)
+            attens = [atten[-1] for atten in decoder_output.cross_attentions]
+            attens = torch.stack(attens).squeeze(3)
+            attens = attens.permute(1,2,0,3)
+            seg_map = self.forward_seg_head(last_hidden_state, attens).sigmoid()
+            output['segmap'] = seg_map
 
         return output
 
-    def json2token(self, obj: Any, update_special_tokens_for_json_key: bool = True, sort_json_key: bool = True, can_value_key=False):
+    def json2token(self, obj: Any, update_special_tokens_for_json_key: bool = True, sort_json_key: bool = True, can_value_key=False, out_sep=False):
         """
         Convert an ordered JSON object into a token sequence
         """
@@ -809,15 +955,20 @@ class DonutModel(PreTrainedModel):
                 for k in keys:
                     if update_special_tokens_for_json_key:
                         self.decoder.add_special_tokens([fr"<s_{k}>", fr"</s_{k}>"])
-                    output += (
-                        fr"<s_{k}>"
-                        + self.json2token(obj[k], update_special_tokens_for_json_key, sort_json_key)
-                        + fr"</s_{k}>"
-                    )
+                    vv = obj[k]
+                    if not out_sep or vv != '':
+                        output += (
+                            fr"<s_{k}>"
+                            + self.json2token(obj[k], update_special_tokens_for_json_key, sort_json_key, can_value_key=can_value_key, out_sep=out_sep)
+                            + fr"</s_{k}>"
+                        )
+                    else:
+                        output += '<sep/>'
+
                 return output
         elif type(obj) == list:
             return r"<sep/>".join(
-                [self.json2token(item, update_special_tokens_for_json_key, sort_json_key) for item in obj]
+                [self.json2token(item, update_special_tokens_for_json_key, sort_json_key, can_value_key=can_value_key, out_sep=out_sep) for item in obj]
             )
         else:
             obj = str(obj)

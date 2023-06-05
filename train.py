@@ -86,9 +86,8 @@ def train(config):
                     else f"<s_{task_name}>",
                     prompt_end_token="<s_answer>" if "docvqa" in dataset_name_or_path else f"<s_{task_name}>",
                     sort_json_key=config.sort_json_key,
-                    out_empty_tags=config.out_empty_tags,
                     classes=config.classes,
-                    nested=config.get('nested',False)
+                    return_charmap=config.get('char_map',False)
                 )
             )
             # prompt_end_token is used for ignoring a given prompt in a loss function

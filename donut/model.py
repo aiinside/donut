@@ -20,12 +20,19 @@ from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.swin_transformer import SwinTransformer
 from timm.models.swin_transformer_v2 import SwinTransformerV2
 from torchvision import transforms
-from torchvision.transforms.functional import resize, rotate
+from torchvision.transforms.functional import resize, rotate, InterpolationMode
+from torchvision.ops import complete_box_iou_loss, box_iou
 from transformers import MBartConfig, MBartForCausalLM, XLMRobertaTokenizer
 from transformers.file_utils import ModelOutput
 from transformers.modeling_utils import PretrainedConfig, PreTrainedModel
+from transformers.generation import LogitsProcessorList
 
 from .health_class_weight import HEALTH_CLASS_WEIGHT, HEALTH_CLASS_WEIGHT_NOSUFFIX
+
+def cxcywh_xyxy(box:torch.Tensor):
+    xc,yc,ww,hh = box.unbind(-1)
+    xyxy = [(xc-0.5*ww), (yc-0.5*hh), (xc+0.5*ww), (yc+0.5*hh)]
+    return torch.stack(xyxy, dim=-1)
 
 class SwinEncoder(nn.Module):
     r"""
@@ -116,7 +123,7 @@ class SwinEncoder(nn.Module):
         x = self.model.layers(x)
         return x
 
-    def prepare_input(self, img: PIL.Image.Image, random_padding: bool = False) -> torch.Tensor:
+    def prepare_input(self, img: PIL.Image.Image, random_padding: bool = False, return_padding=False) -> torch.Tensor:
         """
         Convert PIL Image to tensor according to specified input_size after following steps below:
             - resize
@@ -129,7 +136,7 @@ class SwinEncoder(nn.Module):
             or (self.input_size[0] < self.input_size[1] and img.width < img.height)
         ):
             img = rotate(img, angle=-90, expand=True)
-        img = resize(img, min(self.input_size))
+        img = resize(img, min(self.input_size), interpolation=InterpolationMode.BOX)
         img.thumbnail((self.input_size[1], self.input_size[0]), resample=Resampling.BOX)
         delta_width = self.input_size[1] - img.width
         delta_height = self.input_size[0] - img.height
@@ -145,8 +152,10 @@ class SwinEncoder(nn.Module):
             delta_width - pad_width,
             delta_height - pad_height,
         )
-        return self.to_tensor(ImageOps.expand(img, padding))
-
+        if not return_padding:
+            return self.to_tensor(ImageOps.expand(img, padding))
+        else: 
+            return self.to_tensor(ImageOps.expand(img, padding)), padding
 
 class BARTDecoder(nn.Module):
     """
@@ -187,6 +196,7 @@ class BARTDecoder(nn.Module):
                 vocab_size=len(self.tokenizer),
                 scale_embedding=True,
                 add_final_layer_norm=True,
+                chunk_size_feed_forward=512
             )
         )
         self.model.forward = self.forward  # to get cross attentions and utilize `generate` function
@@ -326,6 +336,7 @@ class BARTDecoder(nn.Module):
             hidden_states=outputs.hidden_states,
             decoder_attentions=outputs.attentions,
             cross_attentions=outputs.cross_attentions,
+            decoder_hidden_states=outputs.hidden_states
         )
 
     @staticmethod
@@ -390,6 +401,9 @@ class DonutConfig(PretrainedConfig):
         name_or_path: Union[str, bytes, os.PathLike] = "",
         enable_token_weight: bool = False,
         swinv2: bool = False,
+        enable_char_map: bool = False,
+        char_penalty: float = 2.,
+        box_pred: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -402,7 +416,10 @@ class DonutConfig(PretrainedConfig):
         self.max_length = max_length
         self.name_or_path = name_or_path
         self.enable_token_weight = enable_token_weight
+        self.enable_char_map = enable_char_map
         self.swinv2 = swinv2
+        self.char_penalty = char_penalty
+        self.box_pred = box_pred
 
 
 class DonutModel(PreTrainedModel):
@@ -433,7 +450,126 @@ class DonutModel(PreTrainedModel):
             enable_token_weight=config.enable_token_weight
         )
 
-    def forward(self, image_tensors: torch.Tensor, decoder_input_ids: torch.Tensor, decoder_labels: torch.Tensor):
+        self.box_head = None
+        if config.box_pred:
+            self.box_head = nn.Sequential(
+                nn.GELU(),
+                nn.Linear(1024, 1024),
+                nn.LayerNorm(1024),
+                nn.GELU(),
+                nn.Linear(1024, 5)
+            )
+
+        self.char_haed = None
+        if config.enable_char_map:
+            self.char_haed = nn.Sequential(
+                nn.ConvTranspose2d(1024,1024,8,8),
+                nn.ReLU(),
+                nn.Conv2d(1024, 1, 3, padding=1)
+            )
+ 
+    def _init_weights(self, module):
+        if isinstance(module, nn.Conv2d):
+            module.bias.data.fill_(0)
+            nn.init.xavier_uniform(module.weight)
+
+    def forward_seg_head(self, encoder_outputs:torch.Tensor, cross_attentions:torch.Tensor, decoder_labels:torch.Tensor = None):
+        if decoder_labels is not None:
+            mask = (decoder_labels != -100).unsqueeze(1).unsqueeze(3).int().float()
+            cross_attentions = cross_attentions * mask
+
+        attens = cross_attentions.max(dim=2)[0]
+
+        clip = torch.where(attens < 0.4)
+        attens[clip] = 0
+
+        hh, ww = self.config.input_size
+        bs = encoder_outputs.shape[0]
+        hh = hh//32
+        ww = ww//32
+        nheads = cross_attentions.shape[1]
+
+        attens = attens.reshape(-1, nheads, hh, ww)
+        attens = torch.pixel_shuffle(attens, 4)
+
+        encoder_outputs = torch.reshape(encoder_outputs, (bs, hh, ww, -1))
+        encoder_outputs = encoder_outputs.permute(0,3,1,2)
+        encoder_outputs = F.pixel_shuffle(encoder_outputs, 4)
+
+        encoder_outputs = attens * encoder_outputs
+        encoder_outputs = F.pixel_unshuffle(encoder_outputs, 4)
+        # encoder_outputs = F.pixel_shuffle(encoder_outputs, 2)
+
+        char_map = self.char_haed(encoder_outputs)
+
+        return char_map
+        # return torch.sigmoid(char_map)
+    
+    def char_loss(self, char_map:torch.Tensor, char_labels: torch.Tensor, decoder_labels: torch.Tensor, cross_attens:torch.Tensor):
+        DELTA = 0.01
+        hh, ww = self.config.input_size
+        hh = hh//32
+        ww = ww//32
+        seg_loss = F.binary_cross_entropy_with_logits(char_map, char_labels)
+
+        # 16heads
+        # [bsize, nheads, seqlen(decoder_input), seqlen(encoder_output)]
+        bs, nheads, seqlen, hw = cross_attens.shape
+        mask = decoder_labels == -100
+        # attens = cross_attens.max(dim=1)[0] # multihead方向にmax取る
+        # attens[mask] = 0
+        # attens = attens.max(dim=1)[0] # seq方向にmaxとる
+        # attens = attens.reshape(-1, 1, hh, ww)
+        # penalty = attens[torch.where(attens<0.1)].mean()
+        attens = cross_attens.clone().permute(0, 2, 1, 3)
+        attens[mask] = 0
+        attens = attens.max(dim=1)[0] # seq方向にmaxとる
+        attens = attens.reshape(-1, nheads, hh, ww)
+        penalty = attens[torch.where(attens<0.1)].mean()
+       
+        # hh, ww = char_map.shape[-2:]
+        # attens = F.interpolate(attens, (hh, ww))
+        attens = self.upscale(attens)
+        loss = F.binary_cross_entropy_with_logits(attens, char_labels)
+        # そこそこいいけど、位置合わせはされてない
+        # 掛け算だけだとズレた位置を抑制する効果がない(ズレたところは かけると0になるため)
+        # score = char_map * attens
+        # loss = F.binary_cross_entropy_with_logits(score, char_labels)
+
+        return seg_loss + loss + penalty * self.config.char_penalty
+
+    def forward_box_head(self, last_hidden_state: torch.Tensor, box_labels: torch.Tensor=None):
+        if self.box_head:
+            # box_pred = self.box_head(last_hidden_state).sigmoid()
+            pred = self.box_head(last_hidden_state).sigmoid()
+            box_pred = pred[:,:,:4]
+            conf = pred[:,:,4]
+            loss = None
+            if not box_labels is None:
+                mask = (box_labels > 0).all(dim=-1)
+                # box数で割りたいので座標方向分掛ける
+                loss_l1 = F.l1_loss(box_pred[mask], box_labels[mask]) * 4
+
+                # iou loss
+                pred_xyxy = cxcywh_xyxy(box_pred)
+                label_xyxy = cxcywh_xyxy(box_labels)
+                loss_iou = complete_box_iou_loss(pred_xyxy[mask], label_xyxy[mask], reduction='mean')
+
+                # iou pred loss
+                # boxの尤度が知りたいのでiouを推定させてみる(samでもやってる)
+                _conf = conf[mask]
+                ious = box_iou(pred_xyxy[mask], label_xyxy[mask])
+                ious = torch.diagonal(ious, dim1=-2, dim2=-1)
+                loss_conf = F.l1_loss(_conf, ious)
+
+                # detrが cls:l1:giou = 2:5:2 だったので2.5倍しておく
+                loss = 2.5 * loss_l1 + loss_iou + loss_conf
+
+            return loss, box_pred, conf
+        
+        return None, None, None
+
+    def forward(self, image_tensors: torch.Tensor, decoder_input_ids: torch.Tensor, decoder_labels: torch.Tensor, char_labels: torch.Tensor=None, box_labels:torch.Tensor=None):
         """
         Calculate a loss given an input image and a desired token sequence,
         the model will be trained in a teacher-forcing manner
@@ -446,11 +582,30 @@ class DonutModel(PreTrainedModel):
         encoder_outputs = self.encoder(image_tensors)
         # encoder_outputs.shape
         # torch.Size([4, 3072, 1024])
+        need_loss = decoder_labels != None
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             encoder_hidden_states=encoder_outputs,
             labels=decoder_labels,
+            output_attentions=need_loss,
+            output_hidden_states=True
         )
+
+        box_loss, _, _ = self.forward_box_head(decoder_outputs[3][-1], box_labels)
+        if box_loss:
+            loss = decoder_outputs[0] + box_loss
+            decoder_outputs = (loss,) + decoder_outputs[1:]
+
+        if need_loss and self.config.enable_char_map:
+            cross_atten = decoder_outputs[5][-1] # 最後のattention layer使う
+            char_map = self.forward_seg_head(encoder_outputs, cross_atten, decoder_labels)
+            # char_loss = self.char_loss(char_map, char_labels, decoder_labels, cross_atten)
+            # loss = char_loss + decoder_outputs[0]
+            seg_loss = F.binary_cross_entropy_with_logits(char_map, char_labels)
+            penalty = cross_atten[torch.where(cross_atten<0.4)].mean()
+            loss = seg_loss + decoder_outputs[0] + penalty*self.config.char_penalty
+            decoder_outputs = (loss,) + decoder_outputs[1:]
+
         return decoder_outputs
 
     def inference(
@@ -461,6 +616,7 @@ class DonutModel(PreTrainedModel):
         prompt_tensors: Optional[torch.Tensor] = None,
         return_json: bool = True,
         return_attentions: bool = False,
+        return_segmap: bool = False,
     ):
         """
         Generate a token sequence in an auto-regressive manner,
@@ -533,7 +689,253 @@ class DonutModel(PreTrainedModel):
                 "cross_attentions": decoder_output.cross_attentions,
             }
 
+        if return_segmap and self.config.enable_char_map:
+            seg_map = self.forward_seg_head(last_hidden_state).sigmoid()
+            output['segmap'] = seg_map
+
         return output
+    
+
+    def inference_custom(
+        self,
+        image: PIL.Image = None,
+        prompt: str = None,
+        image_tensors: Optional[torch.Tensor] = None,
+        prompt_tensors: Optional[torch.Tensor] = None,
+        return_json: bool = True,
+        return_attentions: bool = False,
+        return_segmap: bool = False,
+        token_score_thresh = 0.0,
+    ):
+        """
+        Generate a token sequence in an auto-regressive manner,
+        the generated token sequence is convereted into an ordered JSON format
+
+        Args:
+            image: input document image (PIL.Image)
+            prompt: task prompt (string) to guide Donut Decoder generation
+            image_tensors: (1, num_channels, height, width)
+                convert prompt to tensor if image_tensor is not fed
+            prompt_tensors: (1, sequence_length)
+                convert image to tensor if prompt_tensor is not fed
+        """
+        # prepare backbone inputs (image and prompt)
+        if image is None and image_tensors is None:
+            raise ValueError("Expected either image or image_tensors")
+        if all(v is None for v in {prompt, prompt_tensors}):
+            raise ValueError("Expected either prompt or prompt_tensors")
+
+        if image_tensors is None:
+            image_tensors, pad = self.encoder.prepare_input(image, return_padding=True)
+            image_tensors = image_tensors.unsqueeze(0)
+            dw = pad[0]+pad[2]
+            dh = pad[1]+pad[3]
+            ww, hh = image.size
+            rx = ww / (1-dw/self.encoder.input_size[1])
+            ry = hh / (1-dh/self.encoder.input_size[0])
+            x0 = pad[0] / self.encoder.input_size[1]
+            y0 = pad[1] / self.encoder.input_size[0]
+        else:
+            rx = ry = 1.0
+            x0 = y0 = 0
+
+        if self.device.type == "cuda":  # half is not compatible in cpu implementation.
+            image_tensors = image_tensors.half()
+            image_tensors = image_tensors.to(self.device)
+
+        if prompt_tensors is None:
+            prompt_tensors = self.decoder.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")["input_ids"]
+
+        prompt_tensors = prompt_tensors.to(self.device)
+
+        last_hidden_state = self.encoder(image_tensors)
+        if self.device.type != "cuda":
+            last_hidden_state = last_hidden_state.to(torch.float32)
+
+        encoder_outputs = ModelOutput(last_hidden_state=last_hidden_state, attentions=None)
+
+        if len(encoder_outputs.last_hidden_state.size()) == 1:
+            encoder_outputs.last_hidden_state = encoder_outputs.last_hidden_state.unsqueeze(0)
+        if len(prompt_tensors.size()) == 1:
+            prompt_tensors = prompt_tensors.unsqueeze(0)
+
+        # そもそも予測の段階でthresholdより低いtokenを出さなくする
+        sep_id = self.decoder.tokenizer.encode('<sep/>')[1]
+        def skip_lowconf_token(input_ids: torch.LongTensor, logits: torch.FloatTensor):
+            scores = logits.softmax(dim=-1)
+            max_conf = scores.max(dim=-1)[0]
+            mask = max_conf < token_score_thresh
+
+            for ii, mm in enumerate(mask):
+                if mm:
+                    scores[ii] = 0.
+                    scores[ii][sep_id] = 1.
+                else:
+                    scores[ii] = logits[ii]
+            return scores
+
+        logits_processor = LogitsProcessorList()
+        logits_processor.append(skip_lowconf_token)
+
+        # get decoder output
+        decoder_output = self.decoder.model.generate(
+            decoder_input_ids=prompt_tensors,
+            encoder_outputs=encoder_outputs,
+            max_length=self.config.max_length,
+            early_stopping=True,
+            pad_token_id=self.decoder.tokenizer.pad_token_id,
+            eos_token_id=self.decoder.tokenizer.eos_token_id,
+            use_cache=True,
+            num_beams=1,
+            bad_words_ids=[[self.decoder.tokenizer.unk_token_id]],
+            return_dict_in_generate=True,
+            output_attentions=return_attentions,
+            output_scores=True,
+            output_hidden_states=True,
+            logits_processor=logits_processor
+        )
+
+        output = {"predictions": list()}
+
+        # seq,nhead,1,1,1024, 最終層のattentionしか使わないので最後だけ抜き出す
+        last_decoder_state = [ds[-1] for ds in decoder_output.decoder_hidden_states]
+        last_decoder_state = torch.cat(last_decoder_state, dim=1)
+
+        if self.box_head:
+            _, boxes, box_scores = self.forward_box_head(last_decoder_state)
+            boxes[:,:,0] -= x0
+            boxes[:,:,1] -= y0
+            boxes[:,:,0::2] *= rx
+            boxes[:,:,1::2] *= ry
+        else:
+            bs, nseq = last_decoder_state.shape[:2]
+            boxes = torch.zeros((bs, nseq, 4))
+            box_scores = torch.zeros((bs. nseq))
+
+        output['boxes'] = (boxes[0], box_scores[0])
+        boxes = torch.cat((boxes, box_scores.unsqueeze(-1)), dim=-1)
+        boxes = boxes.detach().cpu().numpy().tolist()
+        scores = torch.amax(torch.cat(decoder_output.scores, dim=0).softmax(dim=-1), dim=-1)
+        scores = scores.detach().cpu().numpy().tolist()
+        predictions = self._decode(decoder_output.sequences[0,1:], scores, boxes[0], return_json)
+        output["predictions"] = predictions
+
+        len_prompt = prompt_tensors.shape[1]
+        # 1画像入力でbatch_size=1とわかっているのでバラしておく
+        output['token_ids'] = decoder_output.sequences[0, len_prompt:]
+        output['tokens_scores'] = decoder_output.scores[0]
+
+
+        if return_attentions:
+            output["attentions"] = {
+                "self_attentions": decoder_output.decoder_attentions,
+                "cross_attentions": decoder_output.cross_attentions,
+            }
+
+        if return_segmap and self.config.enable_char_map:
+            seg_map = self.forward_seg_head(last_hidden_state).sigmoid()
+            output['segmap'] = seg_map
+
+        return output
+
+    def _decode(self, token_ids, scores, boxes, return_json=False):
+        token_strs = self.decoder.tokenizer.convert_ids_to_tokens(token_ids)
+        if return_json:
+            return self.token2json_withbox(token_strs, scores, boxes)
+        else:
+            return self.decoder.tokenizer.convert_tokens_to_string(token_strs)
+
+    def token2json_withbox(self, tokens, scores, boxes, *, is_inner_value=False):
+        """
+        Convert a (generated) token seuqnce into an ordered JSON format
+        """
+        output = dict()
+
+        while len(tokens) != 0:
+            start_token = None
+            for ii, token in enumerate(tokens):
+                start_token = re.search(r"<s_(.*?)>", token, re.IGNORECASE)
+                if start_token is None:
+                    continue
+                istart = ii
+                key = start_token.group(1)
+                start_token = start_token.group()
+                break
+
+            if start_token is None:
+                break
+
+            end_token = None
+            for ii in range(istart+1, len(tokens)):
+                end_token = re.search(fr"</s_{key}>", tokens[ii], re.IGNORECASE)
+                if end_token is None:
+                    continue
+                iend = ii
+                end_token = end_token.group()
+                break
+
+            if end_token is None:
+                tokens = tokens[istart+1:]
+                boxes = boxes[istart+1:]
+                scores = scores[istart+1:]
+                continue
+
+            contents = tokens[istart+1:iend]
+            cboxes = boxes[istart+1:iend]
+            cscores = scores[istart+1:iend]
+            if 0 < len(contents):
+                sfound = False
+                efound = False
+                output[key] = {}
+                for cc in contents:
+                    if "<s_" in cc:
+                        sfound = True
+                    if "</s_" in cc:
+                        efound = True
+
+                if sfound and efound:
+                    values = self.token2json_withbox(contents, cscores, cboxes, is_inner_value=True)
+                    if values:
+                        if len(values) == 1:
+                            values = values[0]
+                        output[key]['content'] = values
+                    else:
+                        output[key]['content'] = ""
+                else:
+                    values = []
+                    contents = self.decoder.tokenizer.convert_tokens_to_string(contents).strip()
+                    for leaf in contents.split(r"<sep/>"):
+                        leaf = leaf.strip()
+                        if (
+                            leaf in self.decoder.tokenizer.get_added_vocab()
+                            and leaf[0] == "<"
+                            and leaf[-2:] == "/>"
+                        ):
+                            leaf = leaf[1:-2]  # for categorical special tokens
+                        values.append(leaf)
+
+                    if len(values) == 1:
+                        values = values[0]
+
+                    output[key]["content"] = values
+
+                score = min(scores[istart], scores[iend])
+                start_box = boxes[istart]
+                end_box = boxes[iend]
+                box = end_box if start_box[4] < end_box[4] else start_box
+                output[key]["box"] = box
+                output[key]["score"] = score
+
+            tokens = tokens[iend+1:]
+            boxes = boxes[iend+1:]
+            scores = scores[iend+1:]
+            if tokens[0] == '<sep/>':
+                return [output] + self.token2json_withbox(tokens, scores, boxes, is_inner_value=True)
+        
+        if len(output):
+            return [output] if is_inner_value else output
+        else:
+            return [] if is_inner_value else {"text_sequence": tokens}
 
     def json2token(self, obj: Any, update_special_tokens_for_json_key: bool = True, sort_json_key: bool = True, can_value_key=False, out_sep=False):
         """

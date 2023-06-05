@@ -38,7 +38,10 @@ class DonutModelPLModule(pl.LightningModule):
                 align_long_axis=self.config.align_long_axis,
                 ignore_mismatched_sizes=True,
                 enable_token_weight=self.config.enable_token_weight,
-                swinv2=self.config.get('swinv2',False)
+                swinv2=self.config.get('swinv2',False),
+                enable_char_map=self.config.get('char_map', False),
+                char_penalty = self.config.get('char_penalty', 2.0),
+                box_pred = self.config.get('box_pred', False)
             )
         else:
             self.model = DonutModel(
@@ -48,6 +51,9 @@ class DonutModelPLModule(pl.LightningModule):
                     align_long_axis=self.config.align_long_axis,
                     enable_token_weight=self.config.enable_token_weight,
                     swinv2=self.config.get('swinv2',False),
+                    enable_char_map=self.config.get('char_map', False),
+                    char_penalty = self.config.get('char_penalty', 2.0),
+                    box_pred = self.config.get('box_pred', False)
                     # with DonutConfig, the architecture customization is available, e.g.,
                     # encoder_layer=[2,2,14,2], decoder_layer=4, ...
                 )
@@ -57,16 +63,27 @@ class DonutModelPLModule(pl.LightningModule):
             for pp in self.model.encoder.parameters():
                 pp.requires_grad = False
 
+    @property
+    def enable_char_map(self):
+        return self.config.get('char_map', False)
+
     def training_step(self, batch, batch_idx):
         image_tensors, decoder_input_ids, decoder_labels = list(), list(), list()
+        cmap_tensors = list()
+        box_tensors = list()
         for batch_data in batch:
             image_tensors.append(batch_data[0])
             decoder_input_ids.append(batch_data[1][:, :-1])
             decoder_labels.append(batch_data[2][:, 1:])
+            box_tensors.append(batch_data[3][:, 1:])
+            if self.enable_char_map:
+                cmap_tensors.append(batch_data[4])
         image_tensors = torch.cat(image_tensors)
         decoder_input_ids = torch.cat(decoder_input_ids)
         decoder_labels = torch.cat(decoder_labels)
-        loss = self.model(image_tensors, decoder_input_ids, decoder_labels)[0]
+        cmap_tensors = torch.cat(cmap_tensors) if self.enable_char_map else None
+        box_tensors = torch.cat(box_tensors) if not (None in box_tensors) else None
+        loss = self.model(image_tensors, decoder_input_ids, decoder_labels, char_labels=cmap_tensors, box_labels=box_tensors)[0]
         self.log_dict({"train_loss": loss}, sync_dist=True)
         return loss
 

@@ -21,6 +21,13 @@ import cv2
 
 from tqdm import tqdm
 
+def decode_imtensor(tensor):
+
+    from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+    mean = torch.Tensor(IMAGENET_DEFAULT_MEAN).reshape(3,1,1)
+    std = torch.Tensor(IMAGENET_DEFAULT_STD).reshape(3,1,1)
+    img = ((tensor*std+mean)*255).permute(1,2,0).numpy().astype(np.uint8)
+    return img
 
 def save_json(write_path: Union[str, bytes, os.PathLike], save_obj: Any):
     with open(write_path, "w") as f:
@@ -31,7 +38,7 @@ def load_json(json_path: Union[str, bytes, os.PathLike]):
     with open(json_path, "r") as f:
         return json.load(f)
 
-def load_dataset(dataset_name_or_path, split, dataset_root='/data/murayama/k8s/ocr_dxs1/donut/dataset', sort_key=False, classes:List[str]=None, out_empty=False, nested=False):
+def load_dataset(dataset_name_or_path, split, dataset_root='/data/murayama/k8s/ocr_dxs1/donut/dataset', sort_key=False, classes:List[str]=None):
     if split == 'train':
         jname = 'train_data.json'
     else:
@@ -54,19 +61,6 @@ def load_dataset(dataset_name_or_path, split, dataset_root='/data/murayama/k8s/o
             if (kk in classes): 
                out.append({kk:vv})
         return out
-    
-    def append_empty(entities, classes):
-        out = []
-        has_val = []
-        for ent in entities:
-            kk, vv = list(ent.items())[0]
-            if not (kk in has_val):
-                has_val.append(kk)
-                out.append({kk:vv})
-        for kk in classes:
-            if not (kk in has_val):
-                out.append({kk:''})
-        return out
 
     def sort_by_key(entities):
         out = []
@@ -83,30 +77,21 @@ def load_dataset(dataset_name_or_path, split, dataset_root='/data/murayama/k8s/o
             entities = _gt[ktask]
             if classes:
                 entities = filter_entities(entities, classes)
-                if out_empty:
-                    entities = append_empty(entities, classes)
 
             if sort_key:
                 entities = sort_by_key(entities)
 
             _gt[ktask] = entities
 
-    if nested:
-        for gt in jdata:
-            _gt = gt['gt_parse']
-            for ktask in _gt:
-                entities = _gt[ktask]
-                new_dict = {'current':[], 'last_1':[], 'last_2':[]}
-                last_dict = {'_0':'current','_1':'last_1','_2':'last_2'}
+        if 'boxes' in gt:
+            entities = gt['boxes']
+            if classes:
+                entities = filter_entities(entities, classes)
+            if sort_key:
+                entities = sort_by_key(entities)
 
-                for ent in entities:
-                    kk, vv = list(ent.items())[0]
-                    cn = kk[:-2]
-                    last = last_dict[kk[-2:]]
-                    new_dict[last].append({cn:vv})
-
-                _gt[ktask] = new_dict
-
+            gt['boxes'] = entities
+            
     return jdata
 
 def resize_pad(img:np.ndarray, pad, target_size):
@@ -116,7 +101,11 @@ def resize_pad(img:np.ndarray, pad, target_size):
     out = np.zeros((th,tw), np.float32)
     ry, rx = th/img.shape[0], tw/img.shape[1]
     rr = min(ry, rx)
-    _img = cv2.resize(img, None, fx=rr, fy=rr)
+    hh = int(rr*img.shape[0])
+    hh = min(hh, th-py0)
+    ww = int(rr*img.shape[1])
+    ww = min(ww, tw-px0)
+    _img = cv2.resize(img, (ww, hh))
     out[py0:py0+_img.shape[0], px0:px0+_img.shape[1]] = _img
 
     return out
@@ -143,9 +132,8 @@ class DonutDataset(Dataset):
         task_start_token: str = "<s>",
         prompt_end_token: str = None,
         sort_json_key: bool = True,
-        out_empty_tags: bool = False,
         classes:List[str] = None,
-        nested = False
+        return_charmap = False
     ):
         super().__init__()
 
@@ -156,9 +144,9 @@ class DonutDataset(Dataset):
         self.task_start_token = task_start_token
         self.prompt_end_token = prompt_end_token if prompt_end_token else task_start_token
         self.sort_json_key = sort_json_key
+        self.return_charmap = return_charmap
 
-        self.dataset = load_dataset(dataset_name_or_path, split=self.split, sort_key=self.sort_json_key, classes=classes, out_empty=out_empty_tags)
-        # self.dataset = load_dataset(dataset_name_or_path, split=self.split, sort_key=self.sort_json_key, out_empty=out_empty_tags, nested=nested)
+        self.dataset = load_dataset(dataset_name_or_path, split=self.split, sort_key=self.sort_json_key, classes=classes)
 
         self.gt_token_sequences = []
         for sample in tqdm(self.dataset):
@@ -204,6 +192,26 @@ class DonutDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.dataset)
+    
+    def prepare_bbox_target(self, boxes, target_tokens):
+        vocab_size = self.donut_model.decoder.tokenizer.vocab_size + 1
+        mask = target_tokens > vocab_size
+        target_boxes = []
+        cnt = 0
+        pad = torch.zeros((4), dtype=torch.float32)
+        pad[:] = -1
+        for mm in mask:
+            if mm:
+                if (cnt//2) < len(boxes):
+                    target_boxes.append(boxes[cnt//2])
+                    cnt+=1
+                else:
+                    target_boxes.append(pad)
+            else:
+                target_boxes.append(pad)
+
+        target_boxes = torch.stack(target_boxes)
+        return target_boxes
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -217,9 +225,10 @@ class DonutDataset(Dataset):
         """
         sample = self.dataset[idx]
         image = PIL.Image.open(sample['image'])
+        ww, hh = image.size
 
         # input_tensor
-        input_tensor = self.donut_model.encoder.prepare_input(image, random_padding=self.split == "train")
+        input_tensor, pad = self.donut_model.encoder.prepare_input(image, random_padding=self.split == "train", return_padding=True)
 
         # input_ids
         processed_parse = random.choice(self.gt_token_sequences[idx])  # can be more than one, e.g., DocVQA Task 1
@@ -230,15 +239,46 @@ class DonutDataset(Dataset):
             padding="max_length",
             truncation=True,
             return_tensors="pt",
-        )["input_ids"].squeeze(0)        
+        )["input_ids"].squeeze(0)
 
         # # char map
-        # fn = os.path.splitext(sample['image'])[0] + '.npy'
-        # cmap = np.load(fn)[:,:,0] # ch0:charmap, ch1:linkmap
-        # cmap = resize_pad(cmap, pad, self.donut_model.encoder.input_size)
-        # # encoderのscale分小さくしておく
-        # # model側でやるとめんどくさいのでここでハードコード
-        # cmap = cv2.resize(cmap, None, fx=1./32, fy=1./32)
+        fn = os.path.splitext(sample['image'])[0] + '.npy'
+        cmap = np.load(fn)[:,:,0] # ch0:charmap, ch1:linkmap
+        # cmap = np.load(fn).max(axis=-1)
+        rate = cmap.shape[0] / max(hh, ww)
+        ch, cw = int(hh*rate), int(ww*rate)
+        cmap = cmap[:ch, :cw] # CRAFT予測時にpaddingした分を取る
+        cmap = resize_pad(cmap, pad, self.donut_model.encoder.input_size)
+        # cmap = cv2.resize(cmap, None, fx=1/4., fy=1/4., interpolation=cv2.INTER_AREA).astype(np.float32)
+        hh, ww = self.donut_model.encoder.input_size
+        # swinのwindowが4x4なので1/4サイズにする
+        cmap = cmap.reshape(hh//4, 4, ww//4, 4).max(axis=(1,3))
+        cmap = cmap[np.newaxis]
+
+        ## bboxes
+        if 'boxes' in sample:
+            ww, hh = image.size
+            boxes = [list(box.values())[0] for box in sample['boxes']]
+            if len(boxes) == 0:
+                boxes = torch.zeros((0,4), dtype=torch.float32)
+            else:
+                dw = pad[0] + pad[2]
+                dh = pad[1] + pad[3]
+                boxes = torch.Tensor(boxes)
+                boxes[:,0::2] /= ww
+                boxes[:,1::2] /= hh
+                boxes[:,0::2] *= 1 - dw/self.donut_model.encoder.input_size[1]
+                boxes[:,1::2] *= 1- dh/self.donut_model.encoder.input_size[0]
+                
+                boxes[:,0::2] += pad[0] / self.donut_model.encoder.input_size[1]
+                boxes[:,1::2] += pad[1] / self.donut_model.encoder.input_size[0]
+                # xyxy2cxcywh
+                boxes[:,2] = boxes[:,2]-boxes[:,0]
+                boxes[:,3] = boxes[:,3]-boxes[:,1]
+                boxes[:,0] = boxes[:,0]+boxes[:,2]/2
+                boxes[:,1] = boxes[:,1]+boxes[:,3]/2
+        else:
+            boxes = None
 
         if self.split == "train":
             labels = input_ids.clone()
@@ -248,7 +288,16 @@ class DonutDataset(Dataset):
             labels[
                 : torch.nonzero(labels == self.prompt_end_token_id).sum() + 1
             ] = self.ignore_id  # model doesn't need to predict prompt (for VQA)
-            return input_tensor, input_ids, labels
+
+            if not boxes is None:
+                box_target = self.prepare_bbox_target(boxes, labels)
+            else:
+                box_target = None
+
+            if not self.return_charmap:
+                return input_tensor, input_ids, labels, box_target
+            else:
+                return input_tensor, input_ids, labels, box_target, cmap
         else:
             prompt_end_index = torch.nonzero(
                 input_ids == self.prompt_end_token_id
