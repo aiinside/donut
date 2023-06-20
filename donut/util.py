@@ -194,8 +194,10 @@ class DonutDataset(Dataset):
         return len(self.dataset)
     
     def prepare_bbox_target(self, boxes, target_tokens):
-        vocab_size = self.donut_model.decoder.tokenizer.vocab_size + 1
+        vocab_size = self.donut_model.decoder.tokenizer.vocab_size
         mask = target_tokens > vocab_size
+        # 1個目は<s_health>確定なので飛ばす
+        mask[1] = False
         target_boxes = []
         cnt = 0
         pad = torch.zeros((4), dtype=torch.float32)
@@ -208,7 +210,11 @@ class DonutDataset(Dataset):
                 else:
                     target_boxes.append(pad)
             else:
-                target_boxes.append(pad)
+                # target_boxes.append(pad)
+                if cnt%2 == 1:
+                    target_boxes.append(boxes[cnt//2])
+                else:
+                    target_boxes.append(pad)
 
         target_boxes = torch.stack(target_boxes)
         return target_boxes
@@ -279,6 +285,17 @@ class DonutDataset(Dataset):
                 boxes[:,1] = boxes[:,1]+boxes[:,3]/2
         else:
             boxes = None
+
+        # img = decode_imtensor(input_tensor).copy()
+        # for bb in boxes:
+        #     x0 = int((bb[0] - bb[2]/2)*1600)
+        #     y0 = int((bb[1] - bb[3]/2)*1600)
+        #     x1 = int((bb[0] + bb[2]/2)*1600)
+        #     y1 = int((bb[1] + bb[3]/2)*1600)
+        #     cv2.rectangle(img, (x0,y0),(x1,y1),(0,255,0),2)
+
+        # cv2.imwrite('hoge.jpg', img)
+        # import pdb;pdb.set_trace()
 
         if self.split == "train":
             labels = input_ids.clone()

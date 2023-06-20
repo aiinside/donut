@@ -547,23 +547,26 @@ class DonutModel(PreTrainedModel):
             loss = None
             if not box_labels is None:
                 mask = (box_labels > 0).all(dim=-1)
-                # box数で割りたいので座標方向分掛ける
-                loss_l1 = F.l1_loss(box_pred[mask], box_labels[mask]) * 4
+                if mask.sum() == 0:
+                    loss = 0
+                else:
+                    # box数で割りたいので座標方向分掛ける
+                    loss_l1 = F.l1_loss(box_pred[mask], box_labels[mask]) * 4
 
-                # iou loss
-                pred_xyxy = cxcywh_xyxy(box_pred)
-                label_xyxy = cxcywh_xyxy(box_labels)
-                loss_iou = complete_box_iou_loss(pred_xyxy[mask], label_xyxy[mask], reduction='mean')
+                    # iou loss
+                    pred_xyxy = cxcywh_xyxy(box_pred)
+                    label_xyxy = cxcywh_xyxy(box_labels)
+                    loss_iou = complete_box_iou_loss(pred_xyxy[mask], label_xyxy[mask], reduction='mean')
 
-                # iou pred loss
-                # boxの尤度が知りたいのでiouを推定させてみる(samでもやってる)
-                _conf = conf[mask]
-                ious = box_iou(pred_xyxy[mask], label_xyxy[mask])
-                ious = torch.diagonal(ious, dim1=-2, dim2=-1)
-                loss_conf = F.l1_loss(_conf, ious)
+                    # iou pred loss
+                    # boxの尤度が知りたいのでiouを推定させてみる(samでもやってる)
+                    _conf = conf[mask]
+                    ious = box_iou(pred_xyxy[mask], label_xyxy[mask])
+                    ious = torch.diagonal(ious, dim1=-2, dim2=-1)
+                    loss_conf = F.l1_loss(_conf, ious)
 
-                # detrが cls:l1:giou = 2:5:2 だったので2.5倍しておく
-                loss = 2.5 * loss_l1 + loss_iou + loss_conf
+                    # detrが cls:l1:giou = 2:5:2 だったので2.5倍しておく
+                    loss = 2.5 * loss_l1 + loss_iou + loss_conf
 
             return loss, box_pred, conf
         
@@ -810,7 +813,7 @@ class DonutModel(PreTrainedModel):
         else:
             bs, nseq = last_decoder_state.shape[:2]
             boxes = torch.zeros((bs, nseq, 4))
-            box_scores = torch.zeros((bs. nseq))
+            box_scores = torch.zeros((bs, nseq))
 
         output['boxes'] = (boxes[0], box_scores[0])
         boxes = torch.cat((boxes, box_scores.unsqueeze(-1)), dim=-1)
@@ -914,17 +917,19 @@ class DonutModel(PreTrainedModel):
                             leaf = leaf[1:-2]  # for categorical special tokens
                         values.append(leaf)
 
-                    if len(values) == 1:
-                        values = values[0]
-
+                    # if len(values) == 1:
+                    #     values = values[0]
+                    values = ''.join(values)
                     output[key]["content"] = values
+            else:
+                output[key] = {'content':''}
 
-                score = min(scores[istart], scores[iend])
-                start_box = boxes[istart]
-                end_box = boxes[iend]
-                box = end_box if start_box[4] < end_box[4] else start_box
-                output[key]["box"] = box
-                output[key]["score"] = score
+            score = min(scores[istart], scores[iend])
+            start_box = boxes[istart]
+            end_box = boxes[iend]
+            box = end_box if start_box[4] < end_box[4] else start_box
+            output[key]["box"] = box
+            output[key]["score"] = score
 
             tokens = tokens[iend+1:]
             boxes = boxes[iend+1:]
