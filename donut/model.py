@@ -22,7 +22,7 @@ from timm.models.swin_transformer_v2 import SwinTransformerV2
 from torchvision import transforms
 from torchvision.transforms.functional import resize, rotate, InterpolationMode
 from torchvision.ops import complete_box_iou_loss, box_iou
-from transformers import MBartConfig, MBartForCausalLM, XLMRobertaTokenizer
+from transformers import MBartConfig, MBartForCausalLM, AutoTokenizer, PreTrainedTokenizerFast
 from transformers.file_utils import ModelOutput
 from transformers.modeling_utils import PretrainedConfig, PreTrainedModel
 from transformers.generation import LogitsProcessorList
@@ -182,9 +182,17 @@ class BARTDecoder(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.enable_token_weight = enable_token_weight
 
-        self.tokenizer = XLMRobertaTokenizer.from_pretrained(
+        self.tokenizer = AutoTokenizer.from_pretrained(
             "hyunwoongko/asian-bart-ecjk" if not name_or_path else name_or_path
         )
+
+        if not self.tokenizer.is_fast:
+            fast = PreTrainedTokenizerFast(__slow_tokenizer=self.tokenizer, from_slow=True)
+            added_tokens = self.tokenizer.added_tokens_encoder
+            added_tokens = sorted(added_tokens.items(), key=lambda x:x[1])
+            added_tokens = [kk[0] for kk in added_tokens]
+            fast.add_special_tokens({'additional_special_tokens':added_tokens})
+            self.tokenizer = fast
 
         self.model = MBartForCausalLM(
             config=MBartConfig(
@@ -307,16 +315,17 @@ class BARTDecoder(nn.Module):
 
             if self.enable_token_weight:
                 class_weight = torch.ones(self.model.config.vocab_size)
+                class_weight[self.tokenizer.vocab_size:] = 20
 
-                for kk, vv in HEALTH_CLASS_WEIGHT.items():
-                    start = fr'<s_{kk}>'
-                    end = fr'</s_{kk}>'
-                    token_ids = self.tokenizer.convert_tokens_to_ids([start, end])
-                    # tokenを変換してみてbartのdefault vocab_sizeより小さかったら
-                    # 登録されてないやつなのでスルーする
-                    if token_ids[0] < 50265 or token_ids[1] < 50265:
-                        continue
-                    class_weight[token_ids] = vv
+                # for kk, vv in HEALTH_CLASS_WEIGHT.items():
+                #     start = fr'<s_{kk}>'
+                #     end = fr'</s_{kk}>'
+                #     token_ids = self.tokenizer.convert_tokens_to_ids([start, end])
+                #     # tokenを変換してみてbartのdefault vocab_sizeより小さかったら
+                #     # 登録されてないやつなのでスルーする
+                #     if token_ids[0] < 50265 or token_ids[1] < 50265:
+                #         continue
+                #     class_weight[token_ids] = vv
 
                 class_weight = class_weight.to(device=logits.device, dtype=logits.dtype)
             else:
@@ -934,8 +943,8 @@ class DonutModel(PreTrainedModel):
             tokens = tokens[iend+1:]
             boxes = boxes[iend+1:]
             scores = scores[iend+1:]
-            if tokens[0] == '<sep/>':
-                return [output] + self.token2json_withbox(tokens, scores, boxes, is_inner_value=True)
+            if len(tokens) != 0 and tokens[0] == '<sep/>':
+                return [output] + self.token2json_withbox(tokens[1:], scores[1:], boxes[1:], is_inner_value=True)
         
         if len(output):
             return [output] if is_inner_value else output

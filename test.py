@@ -104,19 +104,28 @@ def test(config:Config, img_dir:str, save_path:str, score_thresh):
 
     for ii, img_path in tqdm.tqdm(enumerate(img_list)):
         image=PIL.Image.open(img_path)
-        outs = pretrained_model.inference_custom(image, prompt='<s_health>', token_score_thresh=score_thresh)
+        with torch.no_grad():
+            outs = pretrained_model.inference_custom(image, prompt='<s_invoice_nttd>', token_score_thresh=score_thresh)
         # outs = pretrained_model.inference(image, prompt='<s_health>')
         # outs = pretrained_model.inference(image, prompt='<s_health>', return_attentions=True, return_confs=True, return_tokens=True)
         fn = os.path.basename(os.path.splitext(img_path)[0]) + '.json'
         fn = os.path.join(save_path, fn)
         print(img_path)
+        
+        # data = outs['predictions']
+        if 'health' in outs['predictions']:
+            data = outs['predictions']['health']['content']
+        elif 'invoice' in outs['predictions']:
+            data = outs['predictions']['invoice']['content']
+        else:
+            data = outs['predictions']
+
         with open(fn, 'w') as fp:
-            json.dump(outs['predictions'], fp, ensure_ascii=False, indent=4)
+            json.dump(data, fp, ensure_ascii=False, indent=4)
 
         if not config.get('box_pred',False):
             continue
 
-        data = outs['predictions']
         image = np.asarray(image)
         hh, ww = image.shape[:2]
         for ind in data:

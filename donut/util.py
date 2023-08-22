@@ -20,6 +20,7 @@ import numpy as np
 import cv2
 
 from tqdm import tqdm
+import albumentations as alb
 
 def decode_imtensor(tensor):
 
@@ -145,10 +146,11 @@ class DonutDataset(Dataset):
         self.prompt_end_token = prompt_end_token if prompt_end_token else task_start_token
         self.sort_json_key = sort_json_key
         self.return_charmap = return_charmap
-
+        
         self.dataset = load_dataset(dataset_name_or_path, split=self.split, sort_key=self.sort_json_key, classes=classes)
 
         self.gt_token_sequences = []
+        is_pretrain=False
         for sample in tqdm(self.dataset):
             # ground_truth = json.loads(sample["ground_truth"])
             ground_truth = sample
@@ -157,6 +159,8 @@ class DonutDataset(Dataset):
                 gt_jsons = ground_truth["gt_parses"]
             else:
                 assert "gt_parse" in ground_truth and isinstance(ground_truth["gt_parse"], dict)
+                if 'text_sequence' in ground_truth["gt_parse"]:
+                    is_pretrain = True
                 gt_jsons = [ground_truth["gt_parse"]]
 
             self.gt_token_sequences.append(
@@ -172,6 +176,7 @@ class DonutDataset(Dataset):
                     for gt_json in gt_jsons  # load json from list of json
                 ]
             )
+        self.is_pretrain = is_pretrain
         keep = []
         for ii, sample in enumerate(tqdm(self.gt_token_sequences)):
             ids = self.donut_model.decoder.tokenizer(
@@ -179,7 +184,9 @@ class DonutDataset(Dataset):
                 add_special_tokens=False,
                 return_tensors="pt",
             )["input_ids"].squeeze(0)
-            if ids.shape[0] < self.max_length:
+            if is_pretrain:
+                keep.append(ii)
+            elif ids.shape[0] < self.max_length:
                 keep.append(ii)
 
         if len(keep) != len(self.gt_token_sequences):
@@ -190,12 +197,57 @@ class DonutDataset(Dataset):
         self.donut_model.decoder.add_special_tokens([self.task_start_token, self.prompt_end_token])
         self.prompt_end_token_id = self.donut_model.decoder.tokenizer.convert_tokens_to_ids(self.prompt_end_token)
 
+        size = min(self.donut_model.encoder.input_size)
+        self.alb = alb.Compose([
+            alb.SmallestMaxSize(size, cv2.INTER_AREA, True),
+            alb.OneOf([
+                alb.GaussNoise(var_limit=(0,50**2)),
+                alb.ImageCompression(quality_lower=20, quality_upper=30)
+            ])
+        ])
+
     def __len__(self) -> int:
         return len(self.dataset)
-    
-    def prepare_bbox_target(self, boxes, target_tokens):
+
+    def prepare_bbox_pretrain(self, sample, tokenized):
+        boxes = sample['boxes']
+        offset_mapping = tokenized['offset_mapping'][0]
+        offset = len(self.task_start_token)
+        offset_mapping = (offset_mapping-offset).clamp(min=0)
+        merged_boxes = []
+        for from_to in offset_mapping:
+            cands = boxes[from_to[0]:from_to[1]]
+            cands = np.array(cands)
+
+            if len(cands) == 0:
+                x0=y0=x1=y1 = -10000
+            elif len(cands) == 1:
+                x0,y0,x1,y1 = cands[0]
+            else:
+                fx0,fy0,fx1,fy1 = cands[0]
+                bx0,by0,bx1,by1 = cands[-1]
+                fxc = (fx0+fx1)/2
+                fyc = (fy0+fy1)/2
+                bxc = (bx0+bx1)/2
+                byc = (by0+by1)/2
+                diff = ((fxc-bxc)**2+(fyc-byc)**2)**(1/2)
+                w2 = (fx1-fx0)*len(cands)
+                if diff < w2:
+                    x0 = cands[:,0].min()
+                    y0 = cands[:,1].min()
+                    x1 = cands[:,2].max()
+                    y1 = cands[:,3].max()
+                else:
+                    x0,y0,x1,y1 = cands[0]
+
+            merged_boxes.append([x0,y0,x1,y1])
+
+        return merged_boxes
+
+    def prepare_bbox_target(self, boxes, target_tokens, mask=None):
         vocab_size = self.donut_model.decoder.tokenizer.vocab_size
-        mask = target_tokens > vocab_size
+        if mask is None:
+            mask = target_tokens > vocab_size
         # 1個目は<s_health>確定なので飛ばす
         mask[1] = False
         target_boxes = []
@@ -218,6 +270,11 @@ class DonutDataset(Dataset):
 
         target_boxes = torch.stack(target_boxes)
         return target_boxes
+    
+    def _aug_img(self, image):
+        _img = np.asarray(image)
+        _img = self.alb(image=_img)['image']
+        return PIL.Image.fromarray(_img)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -234,37 +291,46 @@ class DonutDataset(Dataset):
         ww, hh = image.size
 
         # input_tensor
+        # _image = self._aug_img(image)
         input_tensor, pad = self.donut_model.encoder.prepare_input(image, random_padding=self.split == "train", return_padding=True)
 
         # input_ids
         processed_parse = random.choice(self.gt_token_sequences[idx])  # can be more than one, e.g., DocVQA Task 1
-        input_ids = self.donut_model.decoder.tokenizer(
+        tokenized = self.donut_model.decoder.tokenizer(
             processed_parse,
             add_special_tokens=False,
             max_length=self.max_length,
             padding="max_length",
             truncation=True,
             return_tensors="pt",
-        )["input_ids"].squeeze(0)
+            return_offsets_mapping=True,
+        )
+        
+        input_ids = tokenized["input_ids"].squeeze(0)
 
         # # char map
-        fn = os.path.splitext(sample['image'])[0] + '.npy'
-        cmap = np.load(fn)[:,:,0] # ch0:charmap, ch1:linkmap
-        # cmap = np.load(fn).max(axis=-1)
-        rate = cmap.shape[0] / max(hh, ww)
-        ch, cw = int(hh*rate), int(ww*rate)
-        cmap = cmap[:ch, :cw] # CRAFT予測時にpaddingした分を取る
-        cmap = resize_pad(cmap, pad, self.donut_model.encoder.input_size)
-        # cmap = cv2.resize(cmap, None, fx=1/4., fy=1/4., interpolation=cv2.INTER_AREA).astype(np.float32)
-        hh, ww = self.donut_model.encoder.input_size
-        # swinのwindowが4x4なので1/4サイズにする
-        cmap = cmap.reshape(hh//4, 4, ww//4, 4).max(axis=(1,3))
-        cmap = cmap[np.newaxis]
+        if self.return_charmap:
+            fn = os.path.splitext(sample['image'])[0] + '.npy'
+            cmap = np.load(fn)[:,:,0] # ch0:charmap, ch1:linkmap
+            # cmap = np.load(fn).max(axis=-1)
+            rate = cmap.shape[0] / max(hh, ww)
+            ch, cw = int(hh*rate), int(ww*rate)
+            cmap = cmap[:ch, :cw] # CRAFT予測時にpaddingした分を取る
+            cmap = resize_pad(cmap, pad, self.donut_model.encoder.input_size)
+            # cmap = cv2.resize(cmap, None, fx=1/4., fy=1/4., interpolation=cv2.INTER_AREA).astype(np.float32)
+            hh, ww = self.donut_model.encoder.input_size
+            # swinのwindowが4x4なので1/4サイズにする
+            cmap = cmap.reshape(hh//4, 4, ww//4, 4).max(axis=(1,3))
+            cmap = cmap[np.newaxis]
 
         ## bboxes
         if 'boxes' in sample:
             ww, hh = image.size
-            boxes = [list(box.values())[0] for box in sample['boxes']]
+            if self.is_pretrain:
+                boxes = self.prepare_bbox_pretrain(sample, tokenized)
+            else:
+                boxes = [list(box.values())[0] for box in sample['boxes']]
+
             if len(boxes) == 0:
                 boxes = torch.zeros((0,4), dtype=torch.float32)
             else:
@@ -286,17 +352,6 @@ class DonutDataset(Dataset):
         else:
             boxes = None
 
-        # img = decode_imtensor(input_tensor).copy()
-        # for bb in boxes:
-        #     x0 = int((bb[0] - bb[2]/2)*1600)
-        #     y0 = int((bb[1] - bb[3]/2)*1600)
-        #     x1 = int((bb[0] + bb[2]/2)*1600)
-        #     y1 = int((bb[1] + bb[3]/2)*1600)
-        #     cv2.rectangle(img, (x0,y0),(x1,y1),(0,255,0),2)
-
-        # cv2.imwrite('hoge.jpg', img)
-        # import pdb;pdb.set_trace()
-
         if self.split == "train":
             labels = input_ids.clone()
             labels[
@@ -307,10 +362,29 @@ class DonutDataset(Dataset):
             ] = self.ignore_id  # model doesn't need to predict prompt (for VQA)
 
             if not boxes is None:
-                box_target = self.prepare_bbox_target(boxes, labels)
+                if self.is_pretrain:
+                    box_mask = labels != self.ignore_id
+                    box_target = []
+                    for ii, mm in enumerate(box_mask):
+                        if not mm:
+                            box_target.append(torch.Tensor([-1,-1,-1,-1]))
+                        else:
+                            box_target.append(torch.Tensor(boxes[ii]))
+                    box_target = torch.stack(box_target).float()
+                else:
+                    box_target = self.prepare_bbox_target(boxes, labels)
             else:
                 box_target = None
 
+            # img = decode_imtensor(input_tensor).copy()
+            # for bb in box_target:
+            #     x0 = int((bb[0] - bb[2]/2)*1600)
+            #     y0 = int((bb[1] - bb[3]/2)*1600)
+            #     x1 = int((bb[0] + bb[2]/2)*1600)
+            #     y1 = int((bb[1] + bb[3]/2)*1600)
+            #     cv2.rectangle(img, (x0,y0),(x1,y1),(0,255,0),2)
+            # cv2.imwrite('hoge.jpg', img)
+            # import pdb;pdb.set_trace()
             if not self.return_charmap:
                 return input_tensor, input_ids, labels, box_target
             else:

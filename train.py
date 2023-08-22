@@ -20,6 +20,7 @@ from sconf import Config
 from donut import DonutDataset
 from lightning_module import DonutDataPLModule, DonutModelPLModule
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 class CustomCheckpointIO(CheckpointIO):
     def save_checkpoint(self, checkpoint, path, storage_options=None):
@@ -86,7 +87,7 @@ def train(config):
                     else f"<s_{task_name}>",
                     prompt_end_token="<s_answer>" if "docvqa" in dataset_name_or_path else f"<s_{task_name}>",
                     sort_json_key=config.sort_json_key,
-                    classes=config.classes,
+                    classes=config.get('classes', None),
                     return_charmap=config.get('char_map',False)
                 )
             )
