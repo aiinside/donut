@@ -6,7 +6,7 @@ core.*
 .nfs*
 .vscode/*
 dataset/*
-result/*
+result*
 misc/*
 !misc/*.png
 !dataset/.gitkeep

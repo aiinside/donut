@@ -22,354 +22,18 @@ from timm.models.swin_transformer_v2 import SwinTransformerV2
 from torchvision import transforms
 from torchvision.transforms.functional import resize, rotate, InterpolationMode
 from torchvision.ops import complete_box_iou_loss, box_iou
-from transformers import MBartConfig, MBartForCausalLM, AutoTokenizer, PreTrainedTokenizerFast
+from transformers import MBartConfig, MBartForCausalLM, AutoTokenizer, PreTrainedTokenizerFast, LiltModel
 from transformers.file_utils import ModelOutput
 from transformers.modeling_utils import PretrainedConfig, PreTrainedModel
 from transformers.generation import LogitsProcessorList
 
-from .health_class_weight import HEALTH_CLASS_WEIGHT, HEALTH_CLASS_WEIGHT_NOSUFFIX
+from .maxvit import MaxxVitBase256
+from .bart_decoder import BARTDecoder
 
 def cxcywh_xyxy(box:torch.Tensor):
     xc,yc,ww,hh = box.unbind(-1)
     xyxy = [(xc-0.5*ww), (yc-0.5*hh), (xc+0.5*ww), (yc+0.5*hh)]
     return torch.stack(xyxy, dim=-1)
-
-class SwinEncoder(nn.Module):
-    r"""
-    Donut encoder based on SwinTransformer
-    Set the initial weights and configuration with a pretrained SwinTransformer and then
-    modify the detailed configurations as a Donut Encoder
-
-    Args:
-        input_size: Input image size (width, height)
-        align_long_axis: Whether to rotate image if height is greater than width
-        window_size: Window size(=patch size) of SwinTransformer
-        encoder_layer: Number of layers of SwinTransformer encoder
-        name_or_path: Name of a pretrained model name either registered in huggingface.co. or saved in local.
-                      otherwise, `swin_base_patch4_window12_384` will be set (using `timm`).
-    """
-
-    def __init__(
-        self,
-        input_size: List[int],
-        align_long_axis: bool,
-        window_size: int,
-        encoder_layer: List[int],
-        name_or_path: Union[str, bytes, os.PathLike] = None,
-        swinv2 = False
-    ):
-        super().__init__()
-        self.input_size = input_size
-        self.align_long_axis = align_long_axis
-        self.window_size = window_size
-        self.encoder_layer = encoder_layer
-
-        self.to_tensor = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
-            ]
-        )
-
-        if not swinv2:
-            self.model = SwinTransformer(
-                img_size=self.input_size,
-                depths=self.encoder_layer,
-                window_size=self.window_size,
-                patch_size=4,
-                embed_dim=128,
-                num_heads=[4, 8, 16, 32],
-                num_classes=0,
-            )
-        else:
-            self.model = SwinTransformerV2(
-                img_size=self.input_size,
-                depths=self.encoder_layer,
-                window_size=window_size,
-                patch_size=4,
-                embed_dim=128,
-                num_heads=[4,8,16,32],
-                num_classes=0
-            )
-
-        # weight init with swin
-        if not name_or_path:
-            swin_state_dict = timm.create_model("swin_base_patch4_window12_384", pretrained=True).state_dict()
-            new_swin_state_dict = self.model.state_dict()
-            for x in new_swin_state_dict:
-                if x.endswith("relative_position_index") or x.endswith("attn_mask"):
-                    pass
-                elif (
-                    x.endswith("relative_position_bias_table")
-                    and self.model.layers[0].blocks[0].attn.window_size[0] != 12
-                ):
-                    pos_bias = swin_state_dict[x].unsqueeze(0)[0]
-                    old_len = int(math.sqrt(len(pos_bias)))
-                    new_len = int(2 * window_size - 1)
-                    pos_bias = pos_bias.reshape(1, old_len, old_len, -1).permute(0, 3, 1, 2)
-                    pos_bias = F.interpolate(pos_bias, size=(new_len, new_len), mode="bicubic", align_corners=False)
-                    new_swin_state_dict[x] = pos_bias.permute(0, 2, 3, 1).reshape(1, new_len ** 2, -1).squeeze(0)
-                else:
-                    new_swin_state_dict[x] = swin_state_dict[x]
-            self.model.load_state_dict(new_swin_state_dict)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (batch_size, num_channels, height, width)
-        """
-        x = self.model.patch_embed(x)
-        x = self.model.pos_drop(x)
-        x = self.model.layers(x)
-        return x
-
-    def prepare_input(self, img: PIL.Image.Image, random_padding: bool = False, return_padding=False) -> torch.Tensor:
-        """
-        Convert PIL Image to tensor according to specified input_size after following steps below:
-            - resize
-            - rotate (if align_long_axis is True and image is not aligned longer axis with canvas)
-            - pad
-        """
-        img = img.convert("RGB")
-        if self.align_long_axis and (
-            (self.input_size[0] > self.input_size[1] and img.width > img.height)
-            or (self.input_size[0] < self.input_size[1] and img.width < img.height)
-        ):
-            img = rotate(img, angle=-90, expand=True)
-        img = resize(img, min(self.input_size), interpolation=InterpolationMode.BOX)
-        img.thumbnail((self.input_size[1], self.input_size[0]), resample=Resampling.BOX)
-        delta_width = self.input_size[1] - img.width
-        delta_height = self.input_size[0] - img.height
-        if random_padding:
-            pad_width = np.random.randint(low=0, high=delta_width + 1)
-            pad_height = np.random.randint(low=0, high=delta_height + 1)
-        else:
-            pad_width = delta_width // 2
-            pad_height = delta_height // 2
-        padding = (
-            pad_width,
-            pad_height,
-            delta_width - pad_width,
-            delta_height - pad_height,
-        )
-        if not return_padding:
-            return self.to_tensor(ImageOps.expand(img, padding))
-        else: 
-            return self.to_tensor(ImageOps.expand(img, padding)), padding
-
-class BARTDecoder(nn.Module):
-    """
-    Donut Decoder based on Multilingual BART
-    Set the initial weights and configuration with a pretrained multilingual BART model,
-    and modify the detailed configurations as a Donut decoder
-
-    Args:
-        decoder_layer:
-            Number of layers of BARTDecoder
-        max_position_embeddings:
-            The maximum sequence length to be trained
-        name_or_path:
-            Name of a pretrained model name either registered in huggingface.co. or saved in local,
-            otherwise, `hyunwoongko/asian-bart-ecjk` will be set (using `transformers`)
-    """
-
-    def __init__(
-        self, decoder_layer: int, max_position_embeddings: int, name_or_path: Union[str, bytes, os.PathLike] = None,
-        enable_token_weight = False
-    ):
-        super().__init__()
-        self.decoder_layer = decoder_layer
-        self.max_position_embeddings = max_position_embeddings
-        self.enable_token_weight = enable_token_weight
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            "hyunwoongko/asian-bart-ecjk" if not name_or_path else name_or_path
-        )
-
-        if not self.tokenizer.is_fast:
-            fast = PreTrainedTokenizerFast(__slow_tokenizer=self.tokenizer, from_slow=True)
-            added_tokens = self.tokenizer.added_tokens_encoder
-            added_tokens = sorted(added_tokens.items(), key=lambda x:x[1])
-            added_tokens = [kk[0] for kk in added_tokens]
-            fast.add_special_tokens({'additional_special_tokens':added_tokens})
-            self.tokenizer = fast
-
-        self.model = MBartForCausalLM(
-            config=MBartConfig(
-                is_decoder=True,
-                is_encoder_decoder=False,
-                add_cross_attention=True,
-                decoder_layers=self.decoder_layer,
-                max_position_embeddings=self.max_position_embeddings,
-                vocab_size=len(self.tokenizer),
-                scale_embedding=True,
-                add_final_layer_norm=True,
-                chunk_size_feed_forward=512
-            )
-        )
-        self.model.forward = self.forward  # to get cross attentions and utilize `generate` function
-
-        self.model.config.is_encoder_decoder = True  # to get cross-attention
-        self.add_special_tokens(["<sep/>"])  # <sep/> is used for representing a list in a JSON
-        self.model.model.decoder.embed_tokens.padding_idx = self.tokenizer.pad_token_id
-        self.model.prepare_inputs_for_generation = self.prepare_inputs_for_inference
-
-        # weight init with asian-bart
-        # if not name_or_path:
-        #     bart_state_dict = MBartForCausalLM.from_pretrained("hyunwoongko/asian-bart-ecjk").state_dict()
-        #     new_bart_state_dict = self.model.state_dict()
-        #     for x in new_bart_state_dict:
-        #         if x.endswith("embed_positions.weight") and self.max_position_embeddings != 1024:
-        #             new_bart_state_dict[x] = torch.nn.Parameter(
-        #                 self.resize_bart_abs_pos_emb(
-        #                     bart_state_dict[x],
-        #                     self.max_position_embeddings
-        #                     + 2,  # https://github.com/huggingface/transformers/blob/v4.11.3/src/transformers/models/mbart/modeling_mbart.py#L118-L119
-        #                 )
-        #             )
-        #         elif x.endswith("embed_tokens.weight") or x.endswith("lm_head.weight"):
-        #             new_bart_state_dict[x] = bart_state_dict[x][: len(self.tokenizer), :]
-        #         else:
-        #             new_bart_state_dict[x] = bart_state_dict[x]
-        #     self.model.load_state_dict(new_bart_state_dict)
-
-    def add_special_tokens(self, list_of_tokens: List[str]):
-        """
-        Add special tokens to tokenizer and resize the token embeddings
-        """
-        newly_added_num = self.tokenizer.add_special_tokens({"additional_special_tokens": sorted(set(list_of_tokens))})
-        if newly_added_num > 0:
-            self.model.resize_token_embeddings(len(self.tokenizer))
-
-    def prepare_inputs_for_inference(self, input_ids: torch.Tensor, encoder_outputs: torch.Tensor, past=None, use_cache: bool = None, attention_mask: torch.Tensor = None):
-        """
-        Args:
-            input_ids: (batch_size, sequence_lenth)
-        Returns:
-            input_ids: (batch_size, sequence_length)
-            attention_mask: (batch_size, sequence_length)
-            encoder_hidden_states: (batch_size, sequence_length, embedding_dim)
-        """
-        attention_mask = input_ids.ne(self.tokenizer.pad_token_id).long()
-        if past is not None:
-            input_ids = input_ids[:, -1:]
-        output = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "past_key_values": past,
-            "use_cache": use_cache,
-            "encoder_hidden_states": encoder_outputs.last_hidden_state,
-        }
-        return output
-
-    def forward(
-        self,
-        input_ids,
-        attention_mask: Optional[torch.Tensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        past_key_values: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        use_cache: bool = None,
-        output_attentions: Optional[torch.Tensor] = None,
-        output_hidden_states: Optional[torch.Tensor] = None,
-        return_dict: bool = None,
-    ):
-        """
-        A forward fucntion to get cross attentions and utilize `generate` function
-
-        Source:
-        https://github.com/huggingface/transformers/blob/v4.11.3/src/transformers/models/mbart/modeling_mbart.py#L1669-L1810
-
-        Args:
-            input_ids: (batch_size, sequence_length)
-            attention_mask: (batch_size, sequence_length)
-            encoder_hidden_states: (batch_size, sequence_length, hidden_size)
-
-        Returns:
-            loss: (1, )
-            logits: (batch_size, sequence_length, hidden_dim)
-            hidden_states: (batch_size, sequence_length, hidden_size)
-            decoder_attentions: (batch_size, num_heads, sequence_length, sequence_length)
-            cross_attentions: (batch_size, num_heads, sequence_length, sequence_length)
-        """
-        output_attentions = output_attentions if output_attentions is not None else self.model.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.model.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.model.config.use_return_dict
-        outputs = self.model.model.decoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            encoder_hidden_states=encoder_hidden_states,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        logits = self.model.lm_head(outputs[0])
-
-        loss = None
-        if labels is not None:
-
-            if self.enable_token_weight:
-                class_weight = torch.ones(self.model.config.vocab_size)
-                class_weight[self.tokenizer.vocab_size:] = 20
-
-                # for kk, vv in HEALTH_CLASS_WEIGHT.items():
-                #     start = fr'<s_{kk}>'
-                #     end = fr'</s_{kk}>'
-                #     token_ids = self.tokenizer.convert_tokens_to_ids([start, end])
-                #     # tokenを変換してみてbartのdefault vocab_sizeより小さかったら
-                #     # 登録されてないやつなのでスルーする
-                #     if token_ids[0] < 50265 or token_ids[1] < 50265:
-                #         continue
-                #     class_weight[token_ids] = vv
-
-                class_weight = class_weight.to(device=logits.device, dtype=logits.dtype)
-            else:
-                class_weight = None
-
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100, weight=class_weight)
-            loss = loss_fct(logits.view(-1, self.model.config.vocab_size), labels.view(-1))
-
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
-
-        return ModelOutput(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            decoder_attentions=outputs.attentions,
-            cross_attentions=outputs.cross_attentions,
-            decoder_hidden_states=outputs.hidden_states
-        )
-
-    @staticmethod
-    def resize_bart_abs_pos_emb(weight: torch.Tensor, max_length: int) -> torch.Tensor:
-        """
-        Resize position embeddings
-        Truncate if sequence length of Bart backbone is greater than given max_length,
-        else interpolate to max_length
-        """
-        if weight.shape[0] > max_length:
-            weight = weight[:max_length, ...]
-        else:
-            weight = (
-                F.interpolate(
-                    weight.permute(1, 0).unsqueeze(0),
-                    size=max_length,
-                    mode="linear",
-                    align_corners=False,
-                )
-                .squeeze(0)
-                .permute(1, 0)
-            )
-        return weight
-
 
 class DonutConfig(PretrainedConfig):
     r"""
@@ -430,7 +94,6 @@ class DonutConfig(PretrainedConfig):
         self.char_penalty = char_penalty
         self.box_pred = box_pred
 
-
 class DonutModel(PreTrainedModel):
     r"""
     Donut: an E2E OCR-free Document Understanding Transformer.
@@ -440,116 +103,45 @@ class DonutModel(PreTrainedModel):
     """
     config_class = DonutConfig
     base_model_prefix = "donut"
+    PRETRAINED_MAXXVIT = '/data/murayama/k8s/ocr_dxs1/donut/pretrained_weights/pretrained_maxxvit.pth'
 
     def __init__(self, config: DonutConfig):
         super().__init__(config)
         self.config = config
-        self.encoder = SwinEncoder(
-            input_size=self.config.input_size,
-            align_long_axis=self.config.align_long_axis,
-            window_size=self.config.window_size,
-            encoder_layer=self.config.encoder_layer,
-            name_or_path=self.config.name_or_path,
-            swinv2=self.config.swinv2
-        )
+        self.encoder = MaxxVitBase256(use_fpn=True)
+
         self.decoder = BARTDecoder(
             max_position_embeddings=self.config.max_position_embeddings,
             decoder_layer=self.config.decoder_layer,
             name_or_path=self.config.name_or_path,
-            enable_token_weight=config.enable_token_weight
         )
 
-        self.box_head = None
-        if config.box_pred:
-            self.box_head = nn.Sequential(
-                nn.GELU(),
-                nn.Linear(1024, 1024),
-                nn.LayerNorm(1024),
-                nn.GELU(),
-                nn.Linear(1024, 5)
-            )
+        self.image_proj = nn.Sequential(
+            nn.Linear(self.encoder.feature_channels[-2], 1024),
+            nn.LayerNorm(1024)
+        )
 
-        self.char_haed = None
-        if config.enable_char_map:
-            self.char_haed = nn.Sequential(
-                nn.ConvTranspose2d(1024,1024,8,8),
-                nn.ReLU(),
-                nn.Conv2d(1024, 1, 3, padding=1)
-            )
+        self.box_head = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(1024, 1024),
+            nn.LayerNorm(1024),
+            nn.GELU(),
+            nn.Linear(1024, 5) # cxcywh+iou
+        )
+
+        if not config.name_or_path:
+            state = torch.load(self.PRETRAINED_MAXXVIT, map_location='cpu')
+            self.encoder.load_state_dict(state)
+
+        self.encoder.freeze()
  
     def _init_weights(self, module):
         if isinstance(module, nn.Conv2d):
             module.bias.data.fill_(0)
             nn.init.xavier_uniform(module.weight)
 
-    def forward_seg_head(self, encoder_outputs:torch.Tensor, cross_attentions:torch.Tensor, decoder_labels:torch.Tensor = None):
-        if decoder_labels is not None:
-            mask = (decoder_labels != -100).unsqueeze(1).unsqueeze(3).int().float()
-            cross_attentions = cross_attentions * mask
-
-        attens = cross_attentions.max(dim=2)[0]
-
-        clip = torch.where(attens < 0.4)
-        attens[clip] = 0
-
-        hh, ww = self.config.input_size
-        bs = encoder_outputs.shape[0]
-        hh = hh//32
-        ww = ww//32
-        nheads = cross_attentions.shape[1]
-
-        attens = attens.reshape(-1, nheads, hh, ww)
-        attens = torch.pixel_shuffle(attens, 4)
-
-        encoder_outputs = torch.reshape(encoder_outputs, (bs, hh, ww, -1))
-        encoder_outputs = encoder_outputs.permute(0,3,1,2)
-        encoder_outputs = F.pixel_shuffle(encoder_outputs, 4)
-
-        encoder_outputs = attens * encoder_outputs
-        encoder_outputs = F.pixel_unshuffle(encoder_outputs, 4)
-        # encoder_outputs = F.pixel_shuffle(encoder_outputs, 2)
-
-        char_map = self.char_haed(encoder_outputs)
-
-        return char_map
-        # return torch.sigmoid(char_map)
-    
-    def char_loss(self, char_map:torch.Tensor, char_labels: torch.Tensor, decoder_labels: torch.Tensor, cross_attens:torch.Tensor):
-        DELTA = 0.01
-        hh, ww = self.config.input_size
-        hh = hh//32
-        ww = ww//32
-        seg_loss = F.binary_cross_entropy_with_logits(char_map, char_labels)
-
-        # 16heads
-        # [bsize, nheads, seqlen(decoder_input), seqlen(encoder_output)]
-        bs, nheads, seqlen, hw = cross_attens.shape
-        mask = decoder_labels == -100
-        # attens = cross_attens.max(dim=1)[0] # multihead方向にmax取る
-        # attens[mask] = 0
-        # attens = attens.max(dim=1)[0] # seq方向にmaxとる
-        # attens = attens.reshape(-1, 1, hh, ww)
-        # penalty = attens[torch.where(attens<0.1)].mean()
-        attens = cross_attens.clone().permute(0, 2, 1, 3)
-        attens[mask] = 0
-        attens = attens.max(dim=1)[0] # seq方向にmaxとる
-        attens = attens.reshape(-1, nheads, hh, ww)
-        penalty = attens[torch.where(attens<0.1)].mean()
-       
-        # hh, ww = char_map.shape[-2:]
-        # attens = F.interpolate(attens, (hh, ww))
-        attens = self.upscale(attens)
-        loss = F.binary_cross_entropy_with_logits(attens, char_labels)
-        # そこそこいいけど、位置合わせはされてない
-        # 掛け算だけだとズレた位置を抑制する効果がない(ズレたところは かけると0になるため)
-        # score = char_map * attens
-        # loss = F.binary_cross_entropy_with_logits(score, char_labels)
-
-        return seg_loss + loss + penalty * self.config.char_penalty
-
     def forward_box_head(self, last_hidden_state: torch.Tensor, box_labels: torch.Tensor=None):
         if self.box_head:
-            # box_pred = self.box_head(last_hidden_state).sigmoid()
             pred = self.box_head(last_hidden_state).sigmoid()
             box_pred = pred[:,:,:4]
             conf = pred[:,:,4]
@@ -581,7 +173,7 @@ class DonutModel(PreTrainedModel):
         
         return None, None, None
 
-    def forward(self, image_tensors: torch.Tensor, decoder_input_ids: torch.Tensor, decoder_labels: torch.Tensor, char_labels: torch.Tensor=None, box_labels:torch.Tensor=None):
+    def forward(self, image_tensors: torch.Tensor, box_ids: torch.Tensor, decoder_input_ids: torch.Tensor, decoder_labels: torch.Tensor, box_labels:torch.Tensor=None):
         """
         Calculate a loss given an input image and a desired token sequence,
         the model will be trained in a teacher-forcing manner
@@ -591,31 +183,24 @@ class DonutModel(PreTrainedModel):
             decoder_input_ids: (batch_size, sequence_length, embedding_dim)
             decode_labels: (batch_size, sequence_length)
         """
-        encoder_outputs = self.encoder(image_tensors)
-        # encoder_outputs.shape
-        # torch.Size([4, 3072, 1024])
+        encoder_outputs = self.encoder(image_tensors)[-2]
+        bs, ch, hh, ww = encoder_outputs.shape
+        encoder_outputs = encoder_outputs.reshape(bs, ch, hh*ww).permute(0,2,1)
+        encoder_outputs = self.image_proj(encoder_outputs)
+
         need_loss = decoder_labels != None
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
+            boxes = box_ids,
             encoder_hidden_states=encoder_outputs,
             labels=decoder_labels,
             output_attentions=need_loss,
             output_hidden_states=True
         )
 
-        box_loss, _, _ = self.forward_box_head(decoder_outputs[3][-1], box_labels)
-        if box_loss:
+        if box_labels is not None:
+            box_loss, _, _ = self.forward_box_head(decoder_outputs[3][-1], box_labels)
             loss = decoder_outputs[0] + box_loss
-            decoder_outputs = (loss,) + decoder_outputs[1:]
-
-        if need_loss and self.config.enable_char_map:
-            cross_atten = decoder_outputs[5][-1] # 最後のattention layer使う
-            char_map = self.forward_seg_head(encoder_outputs, cross_atten, decoder_labels)
-            # char_loss = self.char_loss(char_map, char_labels, decoder_labels, cross_atten)
-            # loss = char_loss + decoder_outputs[0]
-            seg_loss = F.binary_cross_entropy_with_logits(char_map, char_labels)
-            penalty = cross_atten[torch.where(cross_atten<0.4)].mean()
-            loss = seg_loss + decoder_outputs[0] + penalty*self.config.char_penalty
             decoder_outputs = (loss,) + decoder_outputs[1:]
 
         return decoder_outputs
@@ -1058,17 +643,17 @@ class DonutModel(PreTrainedModel):
         model = super(DonutModel, cls).from_pretrained(pretrained_model_name_or_path, revision="official", *model_args, **kwargs)
 
         # truncate or interplolate position embeddings of donut decoder
-        max_length = kwargs.get("max_length", model.config.max_position_embeddings)
-        if (
-            max_length != model.config.max_position_embeddings
-        ):  # if max_length of trained model differs max_length you want to train
-            model.decoder.model.model.decoder.embed_positions.weight = torch.nn.Parameter(
-                model.decoder.resize_bart_abs_pos_emb(
-                    model.decoder.model.model.decoder.embed_positions.weight,
-                    max_length
-                    + 2,  # https://github.com/huggingface/transformers/blob/v4.11.3/src/transformers/models/mbart/modeling_mbart.py#L118-L119
-                )
-            )
-            model.config.max_position_embeddings = max_length
+        # max_length = kwargs.get("max_length", model.config.max_position_embeddings)
+        # if (
+        #     max_length != model.config.max_position_embeddings
+        # ):  # if max_length of trained model differs max_length you want to train
+        #     model.decoder.model.model.decoder.embed_positions.weight = torch.nn.Parameter(
+        #         model.decoder.resize_bart_abs_pos_emb(
+        #             model.decoder.model.model.decoder.embed_positions.weight,
+        #             max_length
+        #             + 2,  # https://github.com/huggingface/transformers/blob/v4.11.3/src/transformers/models/mbart/modeling_mbart.py#L118-L119
+        #         )
+        #     )
+        #     model.config.max_position_embeddings = max_length
 
         return model

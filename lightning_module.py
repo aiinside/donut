@@ -8,6 +8,7 @@ import random
 import re
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytorch_lightning as pl
 import torch
@@ -37,7 +38,6 @@ class DonutModelPLModule(pl.LightningModule):
                 max_length=self.config.max_length,
                 align_long_axis=self.config.align_long_axis,
                 ignore_mismatched_sizes=True,
-                enable_token_weight=self.config.enable_token_weight,
                 swinv2=self.config.get('swinv2',False),
                 enable_char_map=self.config.get('char_map', False),
                 char_penalty = self.config.get('char_penalty', 2.0),
@@ -49,7 +49,6 @@ class DonutModelPLModule(pl.LightningModule):
                     input_size=self.config.input_size,
                     max_length=self.config.max_length,
                     align_long_axis=self.config.align_long_axis,
-                    enable_token_weight=self.config.enable_token_weight,
                     swinv2=self.config.get('swinv2',False),
                     enable_char_map=self.config.get('char_map', False),
                     char_penalty = self.config.get('char_penalty', 2.0),
@@ -63,76 +62,79 @@ class DonutModelPLModule(pl.LightningModule):
             for pp in self.model.encoder.parameters():
                 pp.requires_grad = False
 
+        self.valid_step_outs = []
+
     @property
     def enable_char_map(self):
         return self.config.get('char_map', False)
 
     def training_step(self, batch, batch_idx):
-        image_tensors, decoder_input_ids, decoder_labels = list(), list(), list()
-        cmap_tensors = list()
-        box_tensors = list()
+        image_tensors, decoder_input_ids, box_ids, decoder_labels, token_boxes = list(), list(), list(), list(), list()
         for batch_data in batch:
             image_tensors.append(batch_data[0])
-            decoder_input_ids.append(batch_data[1][:, :-1])
-            decoder_labels.append(batch_data[2][:, 1:])
-            box_tensors.append(batch_data[3][:, 1:])
-            if self.enable_char_map:
-                cmap_tensors.append(batch_data[4])
+            decoder_input_ids.append(batch_data[1])
+            box_ids.append(batch_data[2])
+            decoder_labels.append(batch_data[3])
+            token_boxes.append(batch_data[4])
+
         image_tensors = torch.cat(image_tensors)
         decoder_input_ids = torch.cat(decoder_input_ids)
+        box_ids = torch.cat(box_ids)
         decoder_labels = torch.cat(decoder_labels)
-        cmap_tensors = torch.cat(cmap_tensors) if self.enable_char_map else None
-        box_tensors = torch.cat(box_tensors) if not (None in box_tensors) else None
-        loss = self.model(image_tensors, decoder_input_ids, decoder_labels, char_labels=cmap_tensors, box_labels=box_tensors)[0]
+        token_boxes = torch.cat(token_boxes)
+        loss = self.model(image_tensors, box_ids, decoder_input_ids, decoder_labels, box_labels=token_boxes)[0]
         self.log_dict({"train_loss": loss}, sync_dist=True)
+
+        # image = image_tensors[0].detach().cpu().numpy()*255
+        # image = image.transpose(1,2,0).copy().astype(np.uint8)
+        # v1 = image.copy()
+        # _boxes = box_ids[0].detach().cpu().numpy()/1024*image.shape[0]
+        # for bb in _boxes.astype(np.int32):
+        #     cx,cy,ww,hh = bb
+        #     x0 = cx-ww//2
+        #     x1 = cx+ww//2
+        #     y0 = cy-hh//2
+        #     y1 = cy+hh//2
+        #     cv2.rectangle(image, (x0,y0), (x1,y1), (0,255,0), 2)
+        # cv2.imwrite('hoge0.jpg', image)
+
+        # _boxes = token_boxes[0].detach().cpu().numpy()
+        # _boxes = _boxes*image.shape[0]
+        # for bb in _boxes.astype(np.int32):
+        #     cx,cy,ww,hh = bb
+        #     x0 = cx-ww//2
+        #     x1 = cx+ww//2
+        #     y0 = cy-hh//2
+        #     y1 = cy+hh//2
+        #     cv2.rectangle(v1, (x0,y0), (x1,y1), (0,255,255), 2)
+
+        # cv2.imwrite('hoge1.jpg', v1)
+
+        # import pdb;pdb.set_trace()
+
         return loss
 
     def validation_step(self, batch, batch_idx, dataset_idx=0):
-        image_tensors, decoder_input_ids, prompt_end_idxs, answers = batch
-        decoder_prompts = pad_sequence(
-            [input_id[: end_idx + 1] for input_id, end_idx in zip(decoder_input_ids, prompt_end_idxs)],
-            batch_first=True,
-        )
+        image_tensors, decoder_input_ids, box_ids, decoder_labels, token_boxes = list(), list(), list(), list(), list()
+        for batch_data in batch:
+            image_tensors.append(batch_data[0])
+            decoder_input_ids.append(batch_data[1])
+            box_ids.append(batch_data[2])
+            decoder_labels.append(batch_data[3])
+            token_boxes.append(batch_data[4])
 
-        preds = self.model.inference(
-            image_tensors=image_tensors,
-            prompt_tensors=decoder_prompts,
-            return_json=False,
-            return_attentions=False,
-        )["predictions"]
+        image_tensors = torch.cat(image_tensors)
+        decoder_input_ids = torch.cat(decoder_input_ids)
+        box_ids = torch.cat(box_ids)
+        decoder_labels = torch.cat(decoder_labels)
+        token_boxes = torch.cat(token_boxes)
+        loss = self.model(image_tensors, box_ids, decoder_input_ids, decoder_labels, box_labels=token_boxes)[0]
+        self.valid_step_outs.append(loss)
 
-        scores = list()
-        for pred, answer in zip(preds, answers):
-            pred = re.sub(r"(?:(?<=>) | (?=</s_))", "", pred)
-            answer = re.sub(r"<.*?>", "", answer, count=1)
-            answer = answer.replace(self.model.decoder.tokenizer.eos_token, "")
-            score = Levenshtein.distance(pred, answer) / max(len(pred), len(answer))
-            scores.append(score)
-            # scores.append(edit_distance(pred, answer) / max(len(pred), len(answer)))
-
-            if self.config.get("verbose", False) and len(scores) == 1:
-                self.print(f"Prediction: {pred}")
-                self.print(f"    Answer: {answer}")
-                self.print(f" Normed ED: {scores[0]}")
-
-        return scores
-
-    def validation_epoch_end(self, validation_step_outputs):
-        num_of_loaders = len(self.config.dataset_name_or_paths)
-        if num_of_loaders == 1:
-            validation_step_outputs = [validation_step_outputs]
-        assert len(validation_step_outputs) == num_of_loaders
-        cnt = [0] * num_of_loaders
-        total_metric = [0] * num_of_loaders
-        val_metric = [0] * num_of_loaders
-        for i, results in enumerate(validation_step_outputs):
-            for scores in results:
-                cnt[i] += len(scores)
-                total_metric[i] += np.sum(scores)
-            val_metric[i] = total_metric[i] / cnt[i]
-            val_metric_name = f"val_metric_{i}th_dataset"
-            self.log_dict({val_metric_name: val_metric[i]}, sync_dist=True)
-        self.log_dict({"val_metric": np.sum(total_metric) / np.sum(cnt)}, sync_dist=True)
+    def on_validation_epoch_end(self, validation_step_outputs):
+        score = torch.stack(self.valid_step_outs).mean()
+        self.log_dict({"val_metric": score}, sync_dist=True)
+        self.valid_step_outs.clear()
 
     def configure_optimizers(self):
 
@@ -155,6 +157,7 @@ class DonutModelPLModule(pl.LightningModule):
             "name": "learning_rate",
             "interval": "step",
         }
+        # return optimizer
         return [optimizer], [scheduler]
 
     @staticmethod
